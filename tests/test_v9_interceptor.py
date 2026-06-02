@@ -348,6 +348,205 @@ def test_checkpoint_valid_after_log():
 
 
 # ---------------------------------------------------------------------------
+# External carrier table (real app table, no sys_cache created)
+# ---------------------------------------------------------------------------
+
+def _make_app_db(tmpdir: str) -> str:
+    """Create a realistic 'users' table with enough rows for 1 slot."""
+    db_path = os.path.join(tmpdir, "app.db")
+    con = sqlite3.connect(db_path)
+    con.execute("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            bio TEXT NOT NULL DEFAULT '',
+            trust_score REAL NOT NULL DEFAULT 0.5,
+            profile_score REAL NOT NULL DEFAULT 0.5,
+            avatar_url TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    import random
+    rng = random.Random(42)
+    bios = [
+        "She is currently working on backend services.",
+        "He is presently active on the main platform.",
+        "The system is currently operating at full capacity.",
+        "User is online and working on the deployment pipeline.",
+        "Currently focused on database migration tasks.",
+    ]
+    rows = []
+    for i in range(1, 1601):  # 1 full slot
+        bio = bios[i % len(bios)]
+        ts  = max(0.01, min(0.99, rng.gauss(0.75, 0.12)))
+        ps  = max(0.01, min(0.99, rng.gauss(0.50, 0.15)))
+        av  = f"https://cdn.example.com/avatars/{i}.jpg"
+        rows.append((i, bio, ts, ps, av))
+    con.executemany("INSERT INTO users VALUES (?,?,?,?,?)", rows)
+    con.commit()
+    con.close()
+    return db_path
+
+
+def _make_external_ga(db_path: str) -> GhostAuditInterceptor:
+    cfg = CarrierConfig(
+        table="users",
+        id_field="id",
+        semantic_field="bio",
+        float_a_field="trust_score",
+        float_b_field="profile_score",
+        tilde_field="avatar_url",
+        slot_size=1600,
+        slot_count=1,   # 1 slot = 1600 rows, fits our test table
+    )
+    return GhostAuditInterceptor(
+        db_path=db_path,
+        carrier_config=cfg,
+        force_reinit=True,
+        verbose=False,
+    )
+
+
+def test_external_carrier_does_not_create_sys_cache():
+    """When an external table is used, sys_cache must NOT be created."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        ga = _make_external_ga(db)
+
+        con = sqlite3.connect(db)
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        con.close()
+
+        assert "sys_cache" not in tables, (
+            f"sys_cache should not exist in external-carrier mode, got: {tables}"
+        )
+        assert "users" in tables
+        assert "audit_log" in tables
+        assert "merkle_anchor" in tables
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_external_carrier_orig_ids_from_real_table():
+    """_orig_ids must be populated from real table PKs, not HMAC arithmetic."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        ga = _make_external_ga(db)
+
+        # Real PKs are 1..1600
+        assert len(ga._engine._orig_ids) == 1600
+        assert ga._engine._orig_ids[0] == 1
+        assert ga._engine._orig_ids[-1] == 1600
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_external_carrier_no_write_gate_on_app_table():
+    """The app table must not have write-gate triggers attached to it."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        ga = _make_external_ga(db)
+
+        con = sqlite3.connect(db)
+        triggers = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='users'"
+        ).fetchall()}
+        con.close()
+
+        # GhostAudit must not install gate triggers on the app table
+        gate_triggers = {t for t in triggers if "gate" in t.lower()}
+        assert not gate_triggers, (
+            f"Write-gate triggers must not be on app table 'users': {gate_triggers}"
+        )
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_external_carrier_intercept_and_log():
+    """Full flow: log_event → intercept → recover with external app table."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        ga = _make_external_ga(db)
+        ga.calibrate()
+
+        # Log an event — bits enter the queue
+        seq = ga.log_event("user=alice action=login ip=10.0.0.1")
+        assert seq == 1
+        assert ga.pending_event_count() >= 1
+
+        # Simulate app updating users rows — stego bits get embedded
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "SELECT id, bio, trust_score, profile_score, avatar_url "
+            "FROM users ORDER BY id"
+        ).fetchall()
+
+        for row in rows:
+            rid, bio, ts, ps, av = row
+            fields = {"bio": bio, "trust_score": ts,
+                      "profile_score": ps, "avatar_url": av}
+            final = ga.intercept(rid, fields)
+            con.execute(
+                "UPDATE users SET bio=?, trust_score=?, profile_score=?, avatar_url=? WHERE id=?",
+                (final["bio"], final["trust_score"],
+                 final["profile_score"], final["avatar_url"], rid),
+            )
+            if ga.pending_bit_count() == 0:
+                break
+        con.commit()
+        con.close()
+        assert ga.pending_bit_count() == 0
+
+        # Recovery
+        recovered = ga.recover_events()
+        assert len(recovered) >= 1
+        assert any("alice" in msg for _, msg in recovered)
+
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_app_table_write_is_single_statement():
+    """After intercept(), the app makes ONE update — no double-write."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        ga = _make_external_ga(db)
+
+        ga.log_event("sentinel event")
+
+        updates_on_users = []
+        ga._engine.conn.set_trace_callback(
+            lambda s: updates_on_users.append(s)
+            if "UPDATE" in s.upper() and "users" in s.lower() else None
+        )
+
+        fields = {"bio": "She is currently working on the platform.",
+                  "trust_score": 0.75, "profile_score": 0.50,
+                  "avatar_url": "https://cdn.example.com/1.jpg"}
+
+        before = len(updates_on_users)
+        ga.intercept(row_id=1, fields=fields)
+        after = len(updates_on_users)
+
+        assert after == before, (
+            f"intercept() must not write to DB, saw {after - before} UPDATE(s)"
+        )
+        ga._engine.conn.set_trace_callback(None)
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -370,6 +569,12 @@ if __name__ == "__main__":
         test_v7_passthrough_log_and_recover,
         test_log_event_returns_sequence_number,
         test_checkpoint_valid_after_log,
+        # External carrier tests
+        test_external_carrier_does_not_create_sys_cache,
+        test_external_carrier_orig_ids_from_real_table,
+        test_external_carrier_no_write_gate_on_app_table,
+        test_external_carrier_intercept_and_log,
+        test_app_table_write_is_single_statement,
     ]
     passed = failed = 0
     for t in tests:

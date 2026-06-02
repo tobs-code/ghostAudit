@@ -2,16 +2,35 @@
 
 > Research project — not intended for production use.
 
-GhostAudit hides audit logs **steganographically inside ordinary SQLite user data**. A privileged attacker who deletes the visible log tables finds nothing — the real forensic data is invisibly embedded in carrier fields and cryptographically secured.
+GhostAudit hides audit logs **steganographically inside ordinary SQLite user data**. In the current V9 path, the carrier is a real application table supplied by the caller, and GhostAudit overlays bits on normal app writes. A privileged attacker who deletes the visible log tables finds nothing — the real forensic data is invisibly embedded in carrier fields and cryptographically secured.
 
 ```python
-from core.ghost_audit_v7 import GhostAuditV7
+from core.carrier_config import CarrierConfig
+from core.ghost_audit_v9 import GhostAuditInterceptor
 import secrets
 
-ga = GhostAuditV7(db_path="audit.db", secret_key=secrets.token_hex(32))
+carrier = CarrierConfig(
+    table="users",
+    id_field="id",
+    semantic_field="bio",
+    float_a_field="trust_score",
+    float_b_field="profile_score",
+    tilde_field="avatar_url",
+)
+
+ga = GhostAuditInterceptor(
+    db_path="app.db",
+    carrier_config=carrier,
+    secret_key=secrets.token_hex(32),
+)
 ga.log_event("user=alice action=login ip=10.0.0.1")
 
-# attacker deletes audit_log — doesn't matter
+# App write hook: one UPDATE, with stego overlay folded into the app fields.
+fields = {"bio": bio, "trust_score": trust, "profile_score": profile, "avatar_url": url}
+fields = ga.intercept(row_id=user_id, fields=fields)
+# UPDATE users SET bio=?, trust_score=?, profile_score=?, avatar_url=? WHERE id=?
+
+# attacker deletes audit_log — recovery still reads the carrier table
 events = ga.recover_events()   # → [( 1, "user=alice action=login ip=10.0.0.1")]
 ```
 
@@ -22,13 +41,13 @@ pip install reedsolo cryptography numpy
 python quickstart.py   # see it in action
 ```
 
-See [quickstart.py](../quickstart.py) for a full demo including attack simulation and recovery.
+See [quickstart.py](../quickstart.py) for the legacy standalone demo including attack simulation and recovery.
 
 ---
 
 > Forschungsprojekt — nicht für den Produktionseinsatz gedacht.
 
-GhostAudit versteckt Audit-Logs steganographisch in normalen SQLite-Nutzerdaten. Ein privilegierter Angreifer, der die sichtbaren Log-Tabellen löscht, findet die echten forensischen Daten nicht — sie sind unsichtbar in Carrier-Feldern eingebettet und kryptographisch gesichert.
+GhostAudit versteckt Audit-Logs steganographisch in normalen SQLite-Nutzerdaten. Der aktuelle V9-Pfad nutzt dafür eine echte Applikationstabelle als Carrier und legt Stego-Bits als minimale Overlays auf normale App-Writes. Ein privilegierter Angreifer, der die sichtbaren Log-Tabellen löscht, findet die echten forensischen Daten nicht — sie sind unsichtbar in Carrier-Feldern eingebettet und kryptographisch gesichert.
 
 ---
 
@@ -55,24 +74,38 @@ pip install reedsolo cryptography numpy
 ```
 
 ```python
-from core.ghost_audit_v7 import GhostAuditV7
+from core.carrier_config import CarrierConfig
+from core.ghost_audit_v9 import GhostAuditInterceptor
 import secrets
 
 # Generiere einen sicheren 256-Bit Schlüssel
 my_key = secrets.token_hex(32)
 
-ga = GhostAuditV7(
-    db_path="audit.db",
+carrier = CarrierConfig(
+    table="users",
+    id_field="id",
+    semantic_field="bio",
+    float_a_field="trust_score",
+    float_b_field="profile_score",
+    tilde_field="avatar_url",
+)
+
+ga = GhostAuditInterceptor(
+    db_path="app.db",
+    carrier_config=carrier,
     secret_key=my_key,
     verbose=False,
 )
+
+ga.calibrate()  # optional: Synonym-Verteilung aus echten Rows lernen
 ```
 
 Mit Rollback-Schutz und Heartbeat:
 
 ```python
-ga = GhostAuditV7(
-    db_path="audit.db",
+ga = GhostAuditInterceptor(
+    db_path="app.db",
+    carrier_config=carrier,
     secret_key="mein-key",
     external_state_path="E:\\secure_mount\\audit.evolve",
     metronome_interval=300,   # Heartbeat alle 5 Minuten
@@ -91,13 +124,13 @@ SQLite-Datenbank
 ├── audit_log          ← sichtbarer Köder (Angreifer löscht hier)
 ├── audit_archive      ← zweiter Köder
 │
-└── sys_cache          ← versteckter Layer (8.000 Zeilen)
+└── users              ← echte App-Tabelle als Carrier (V9)
     │
     ├── Slot 0..4      ← je 1.600 Zeilen
     │   ├── 72 Header-Bits  (keyed Magic, Länge, nsym, Sequence)
     │   └── 1.528 Payload-Zeilen
-    │       └── Jede Zeile kodiert alle 5 Kanäle gleichzeitig (V8 Multiplexing)
-    │           {Ch0, Ch1, Ch2, Ch3, Parity} via HMAC-Permutation auf 5 Carrier
+    │       └── Jede Zeile kodiert alle 5 logischen Streams gleichzeitig (V8 Multiplexing)
+    │           {Data0, Data1, Data2, P-Parity, Q-Parity} via HMAC-Permutation auf 5 Carrier
     │
     ├── sys_cache_manifest   ← Row-MACs (5×8 Byte pro Zeile)
     ├── sys_channel_quality  ← EMA-Degradationshistorie pro Kanal
@@ -105,6 +138,11 @@ SQLite-Datenbank
     ├── event_mac_tags       ← per-Event HMAC-Tags
     └── fs_key_state         ← Forward-Secrecy evolve_count
 ```
+
+Im V7/V8-Kompatibilitätsmodus heißt die Carrier-Tabelle weiterhin `sys_cache`.
+V9 ist der steganalytisch härtere Pfad: Die Carrier-Rows stammen aus einer echten
+Applikationstabelle, `sys_cache` wird in diesem Modus nicht synthetisch angelegt,
+und das App-Schema wird über `CarrierConfig` beschrieben.
 
 **V8 Multiplexing vs. V7 Round-Robin:**
 
@@ -148,7 +186,7 @@ Von innen nach außen:
 | 5 | **RAID-6 P+Q Parität** | XOR-Parität (P) + GF(2⁸)-gewichtete Parität (Q). Toleriert Verlust beliebiger 2/5 Kanäle. |
 | 6 | **Carrier-Shuffling** | HMAC-basierte Permutation pro Zeile. Angreifer kennt Carrier-Zuordnung nicht. |
 | 7 | **Forward-Secure Slot-Keys** | HKDF-abgeleitete Subkeys pro Slot. Kompromittierung eines Slots gefährdet keine anderen. |
-| 8 | **SQLite Write-Gate** | Trigger blockiert unkontrollierte `sys_cache`-Writes. |
+| 8 | **SQLite Write-Gate** | Trigger blockiert unkontrollierte interne Carrier-Writes im Legacy-Pfad; V9 legt keine Gate-Trigger auf die App-Tabelle. |
 | 9 | **Merkle-Root** | HMAC-SHA256-Baum über alle 5 Slots. Erkennt jede nachträgliche Manipulation. |
 | 10 | **Forward Secrecy (Anchor-Keys)** | `k_write_merkle` evolviert nach jedem Event via HMAC. Alter Key wird überschrieben. |
 | 11 | **Proactive Self-Healing** | Degradierte Slots werden im Hintergrund mit erhöhten ECC-Parametern neu geschrieben. |
@@ -156,6 +194,16 @@ Von innen nach außen:
 ---
 
 ## Feature-Übersicht nach Version
+
+### V9 — Real-Carrier Interceptor
+
+- `GhostAuditInterceptor` nutzt eine vorhandene App-Tabelle statt synthetischer `sys_cache`-Rows
+- `CarrierConfig` macht Tabellen- und Feldnamen konfigurierbar (`users.bio`, `trust_score`, `profile_score`, `avatar_url`, ...)
+- `intercept(row_id, fields)` faltet Stego-Bits in den normalen App-Write ein: ein App-UPDATE, kein separater Carrier-Write pro Row
+- Header-Rows werden pro Slot reserviert; Payload-Bits werden nur in Payload-Rows eingebettet
+- Vollständig eingebettete Payloads werden später per `flush_headers()` bzw. automatisch vor `recover_events()` mit V7-Headern versehen
+- Synonym-Encoding kann via `calibrate()` aus echten Rows an die lokale Textverteilung angepasst werden
+- V7 ECC/RAID-6, HMAC-Shuffling, Merkle, Rollback-Schutz und Checkpoints bleiben als Engine-Primitiven erhalten
 
 ### V8 — Multiplexing & RAID-6
 
@@ -262,7 +310,7 @@ rebuild_nsym = min(target_nsym, payload_rows // 8)         # Kapazitäts-Cap
 Ein Checkpoint ist ein kompaktes, signiertes JSON-Dokument, das den DB-Zustand zu einem bestimmten Zeitpunkt festhält. Er ist dafür gedacht, in einer **externen, read-only Location** gespeichert zu werden — Git-Repo, separate Datei, Pastebin — und dort als unabhängiger Witness zu fungieren.
 
 **Was ein Checkpoint beweist (mit Master-Key):**
-- Der Merkle-Root von `sys_cache` war genau `R` bei Sequence `N`
+- Der Merkle-Root des Carrier-Layers war genau `R` bei Sequence `N`
 - Die Event-Kette (`entry_hash`-Chain) war zu diesem Zeitpunkt intakt
 - Die Anchor-Kette (`anchor_hash`-Chain) war zu diesem Zeitpunkt intakt
 - Der Checkpoint selbst wurde nicht manipuliert (MAC-Feld)
@@ -291,7 +339,7 @@ Ein Checkpoint ist ein kompaktes, signiertes JSON-Dokument, das den DB-Zustand z
 result = ga.verify_checkpoint(cp)
 # result["valid"]              → alle 4 Checks OK?
 # result["mac_valid"]          → Checkpoint nicht manipuliert?
-# result["root_match"]         → sys_cache unverändert seit Checkpoint?
+# result["root_match"]         → Carrier-Layer unverändert seit Checkpoint?
 # result["entry_chain_match"]  → Event-Kette unverändert?
 # result["anchor_chain_match"] → Anchor-Kette unverändert?
 # result["details"]            → "OK" oder Fehlerbeschreibung
@@ -364,11 +412,26 @@ Ab V8.6 ist Git-Witness als Standard implementiert. Wenn sich die `*.evolve`-Dat
 
 ## API-Referenz
 
-### Konstruktor
+### V9 Konstruktor
 
 ```python
-GhostAuditV7(
-    db_path="ghost_audit_v7.db",
+from core.carrier_config import CarrierConfig
+from core.ghost_audit_v9 import GhostAuditInterceptor
+
+carrier = CarrierConfig(
+    table="users",
+    id_field="id",
+    semantic_field="bio",
+    float_a_field="trust_score",
+    float_b_field="profile_score",
+    tilde_field="avatar_url",
+    slot_size=1600,
+    slot_count=5,
+)
+
+ga = GhostAuditInterceptor(
+    db_path="app.db",
+    carrier_config=carrier,    # None nutzt Legacy-sys_cache-Layout
     secret_key=None,           # oder GHOST_AUDIT_KEY env-var
     key_provider=None,         # DPAPI / EnvKeyProvider
     ecc_symbols=36,
@@ -379,6 +442,25 @@ GhostAuditV7(
     external_state_path=None,  # Rollback-Erkennungsdatei
     force_reinit=False,        # Admin-Override: überspringt alle Rollback-Checks (für Tests / DB-Neuanlage)
 )
+```
+
+### V9 App-Write-Hook
+
+```python
+ga.log_event("user=alice action=login")
+
+fields = {
+    "bio": current_bio,
+    "trust_score": current_trust_score,
+    "profile_score": current_profile_score,
+    "avatar_url": current_avatar_url,
+}
+fields = ga.intercept(row_id=user_id, fields=fields)
+
+# Die App schreibt genau diese Werte mit ihrem normalen UPDATE.
+# Nach dem Commit kann optional explizit geflusht werden; recover_events()
+# ruft flush_headers() ebenfalls automatisch auf.
+ga.flush_headers()
 ```
 
 ### Logging
@@ -418,7 +500,7 @@ cp = ga.export_checkpoint(path="checkpoint.json")
 result = ga.verify_checkpoint(cp)                        # aus dict
 result = ga.verify_checkpoint(None, path="checkpoint.json")  # aus Datei
 # result["valid"]              → True/False
-# result["root_match"]         → sys_cache unverändert?
+# result["root_match"]         → Carrier-Layer unverändert?
 # result["entry_chain_match"]  → Event-Kette unverändert?
 # result["anchor_chain_match"] → Anchor-Kette unverändert?
 # result["details"]            → "OK" oder Fehlerbeschreibung
@@ -453,6 +535,9 @@ python tests/sweep_wipe_v8.py
 
 # Rollback-Erkennung
 python tests/test_rollback_v82.py
+
+# V9 Interceptor / echter Carrier
+python -m pytest tests/test_v9_interceptor.py -q
 
 # Härtungs-Tests (LSB, Forward Security, Merkle, Export)
 python tests/test_hardenings_v7.py
@@ -509,11 +594,13 @@ python tests/benchmark_throughput_v8.py
 ## Bekannte Grenzen
 
 - **Forschungsprototyp** — kein produktionsreifes Auditsystem
+- V9 benötigt genügend echte Carrier-Rows und App-Writes, um pending Payload-Bits vollständig einzubetten.
+- Header-Rows werden aktuell slotweise direkt über die GhostAudit-Engine geschrieben; Payload-Writes laufen über den App-Hook.
 - ORM-Textnormalisierung (TRIM, lowercase, synonym-flatten) zerstört bio-basierte Carrier. Bio-SPOF Fix reduziert das von 3/5 auf 2/5 Carrier-Kill.
 - RAID-6 toleriert **beliebige** 2/5 Carrier-Kill. Bei 3/5 ist keine Recovery möglich.
 - Forward Security schützt Slots voneinander, nicht vor Verlust des Master-Keys.
 - Rollback-Schutz hat eine dokumentierte Grenze: Werden DB und `.evolve`-Datei gemeinsam aus demselben Snapshot wiederhergestellt, wird kein Rollback erkannt.
-- `audit_archive` ist absichtlicher Köder — echte Recovery nur aus `sys_cache`.
+- `audit_archive` ist absichtlicher Köder — echte Recovery kommt aus der Carrier-Tabelle (`users` in V9, `sys_cache` im Legacy-Modus).
 
 ---
 
@@ -521,13 +608,16 @@ python tests/benchmark_throughput_v8.py
 
 ```
 core/
-├── ghost_audit_v7.py          Hauptimplementierung (V7–V8.5)
+├── ghost_audit_v9.py          Interceptor-Architektur mit echtem App-Carrier
+├── carrier_config.py          Konfiguration für Carrier-Tabelle und Felder
+├── ghost_audit_v7.py          Engine und Legacy-sys_cache-Modus (V7–V8.x)
 ├── ecc_layer.py               Reed-Solomon Utilities
 ├── key_provider.py            DPAPI / EnvKeyProvider
 ├── worker_erasure.py          Erasure-Recovery
 └── security_suite_support.py  Factory, CLI-Flags, Test-Gate-Bypass
 
 tests/
+├── test_v9_interceptor.py     V9 Hook, echter Carrier, External-Carrier-Recovery
 ├── quickstart_tests.py        Interaktives Testmenü
 ├── master_test_suite_v7.py    Orchestrator, erzeugt JSON-Report
 ├── attack_simulator_v8.py     5 Angriffsvektoren (MITRE ATT&CK)
