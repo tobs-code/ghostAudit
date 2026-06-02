@@ -29,6 +29,7 @@ gradual_decay_ramp_results.csv
 # Internal / tool-specific docs not for public release
 docs/subagent_report.md
 docs/security_research_report.md
+docs/security_review.md
 
 # Subdirectories that contain only generated output
 reports/
