@@ -34,7 +34,7 @@ fields = ga.intercept(row_id=user_id, fields=fields)
 events = ga.recover_events()   # → [( 1, "user=alice action=login ip=10.0.0.1")]
 ```
 
-**How it works:** Events are encoded into synonym choices in bio text, LSBs of float score columns, trailing spaces, and URL tilde suffixes — spread across 5 logical channels with RAID-6 erasure coding and Reed-Solomon ECC. An attacker who doesn't know the master key cannot find, read, or undetectably modify the logs.
+**How it works:** Events are encoded into synonym choices in bio text, LSBs of float score columns, opportunistic text-shape variants, and URL tilde suffixes — spread across 5 logical channels with RAID-6 erasure coding and Reed-Solomon ECC. An attacker who doesn't know the master key cannot find, read, or undetectably modify the logs.
 
 ```
 pip install reedsolo cryptography numpy
@@ -163,13 +163,17 @@ Fünf physische Carrier, per HMAC-Permutation pro Zeile auf logische Kanäle gem
 |-------|------|---------|------------|
 | Ch0 | `bio` | Synonym-Switching (`currently/presently`, `active/online`, `working/operating`, `system/platform`) | TRIM, lowercase |
 | Ch1 | `trust_score` | Float LSB-Matching ±1 (stochastisch) | Float-Rounding |
-| Ch2 | `bio` | Trailing-Space am Zeilenende | TRIM |
+| Ch2 | `bio` | `TextShapeCarrier` — opportunistische Interpunktions-/Textform-Variante | Korpusabhängig, Kapazität variiert |
 | Ch3 | `profile_score` | Float LSB-Matching ±1 (ORM-unabhängig von `bio`) | Float-Rounding |
 | Ch4 | `avatar_url` | Tilde-Suffix (`~` = Bit 1) — RFC-3986 unreserved | URL-Normalisierung |
 
 **Carrier-Shuffling:** Die Zuordnung physischer Carrier zu logischen Kanälen wechselt per HMAC pro Zeile. Ein Angriff auf einen physischen Carrier verteilt den Schaden gleichmäßig auf alle 5 logischen Kanäle (~20% pro Kanal).
 
 **Bio-SPOF Fix (V8):** Carrier 3 war ursprünglich Case-Switching auf `bio`. ORM-Normalisierung hätte damit 3/5 Carrier gleichzeitig zerstört. `profile_score` ist eine unabhängige Float-Spalte — Bio-Normalize killt jetzt nur noch 2/5 Carrier.
+
+**TextShapeCarrier (V9):** Der frühere Trailing-Space-Carrier wurde im V9-Payload-Pfad durch einen opportunistischen Textform-Carrier ersetzt. Er schreibt nur auf Rows mit sicherer, lokal decodierbarer Textform; andernfalls wird die Row per row-level gating übersprungen und das pending Payload-Bit nicht verbraucht.
+
+**Temporal Delay (V9):** Payloads starten nicht immer sofort auf der ersten elegiblen Row. Ein kleiner deterministischer `temporal_delay_rows`-Puffer glättet den direkten `log_event()` → `intercept()`-Pfad, damit das Schreibmuster weniger eng an einzelne Audit-Events gebunden ist.
 
 ---
 

@@ -34,6 +34,7 @@ Status: V9 is under active development.  V7 standalone mode is unaffected.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
@@ -47,6 +48,22 @@ from typing import Any
 from core.carrier_config import CarrierConfig, v7_default_config
 from core.ghost_audit_v7 import GhostAuditV7, StegoEngine
 from reedsolo import RSCodec, ReedSolomonError
+
+
+@dataclass(frozen=True)
+class EncodeResult:
+    text: str
+    written: bool
+    reason: str = ""
+    carrier_family: str = ""
+
+
+@dataclass(frozen=True)
+class InterceptResult:
+    fields: dict[str, Any]
+    modified: bool
+    reason: str = ""
+    row_id: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +312,51 @@ class SemanticCalibrator:
 
 
 # ---------------------------------------------------------------------------
+# Text-shape carrier
+# ---------------------------------------------------------------------------
+
+class TextShapeCarrier:
+    """Opportunistic replacement for the trailing-space carrier.
+
+    Invariant: the learned/profiled corpus may decide whether we are allowed
+    to write, but decoding must be profile-independent.  Recovery reads the
+    bit from the text shape itself; missing/ambiguous shapes are erasures.
+    """
+
+    # Narrow first-cut family: Oxford comma in simple three-item lists.
+    # bit=1: "A, B, and C"; bit=0: "A, B and C".
+    _OXFORD_RE = re.compile(
+        r"\b([A-Za-z][A-Za-z0-9_+-]*), "
+        r"([A-Za-z][A-Za-z0-9_+-]*)"
+        r"(,?) and "
+        r"([A-Za-z][A-Za-z0-9_+-]*)\b"
+    )
+
+    @classmethod
+    def encode_bit(cls, text: str, bit: int) -> EncodeResult:
+        if not text:
+            return EncodeResult(text or "", False, "empty_text", "text_shape")
+
+        m = cls._OXFORD_RE.search(text)
+        if not m:
+            return EncodeResult(text, False, "no_safe_text_shape", "text_shape")
+
+        comma = "," if bit else ""
+        replacement = f"{m.group(1)}, {m.group(2)}{comma} and {m.group(4)}"
+        new_text = text[:m.start()] + replacement + text[m.end():]
+        return EncodeResult(new_text, True, "", "text_shape_oxford")
+
+    @classmethod
+    def decode_bit(cls, text: str) -> int | None:
+        if not text:
+            return None
+        m = cls._OXFORD_RE.search(text)
+        if not m:
+            return None
+        return 1 if m.group(3) == "," else 0
+
+
+# ---------------------------------------------------------------------------
 # Bit-level carrier helpers
 # ---------------------------------------------------------------------------
 
@@ -326,9 +388,11 @@ def _encode_bit_into_fields(
     if fa in result and result[fa] is not None:
         result[fa] = StegoEngine.encode_bit_float_lsb(result[fa], bit, row_id=row_id)
 
-    # carrier 2: trailing space (same field as semantic)
+    # carrier 2: text-shape carrier (same field as semantic)
     if sem in result and result[sem] is not None:
-        result[sem] = StegoEngine.encode_bit_trailing_space(result[sem], bit)
+        encoded = TextShapeCarrier.encode_bit(result[sem], bit)
+        if encoded.written:
+            result[sem] = encoded.text
 
     # carrier 3: float_b LSB
     if fb in result and result[fb] is not None:
@@ -367,7 +431,9 @@ def _decode_bit_from_fields(
             votes.append(b)
 
     if sem in fields and fields[sem]:
-        votes.append(StegoEngine.decode_bit_trailing_space(fields[sem]))
+        b = TextShapeCarrier.decode_bit(fields[sem])
+        if b is not None:
+            votes.append(b)
 
     if fb in fields and fields[fb] is not None:
         b = StegoEngine.decode_bit_float_lsb(fields[fb])
@@ -408,6 +474,7 @@ class _PendingPayload:
         stored_msg_len: int,
         compressed: bool,
         repetitions: int = 1,
+        start_after_rows: int = 0,
     ):
         # Convert each channel's bytes to a flat bit list
         self.channel_bits: dict[int, list[int]] = {}
@@ -422,6 +489,8 @@ class _PendingPayload:
         self.stored_msg_len = stored_msg_len
         self.compressed = compressed
         self.repetitions = max(1, repetitions)
+        self.start_after_rows = max(0, start_after_rows)
+        self.rows_seen = 0
         self._pos = 0   # current bit position (same for all channels)
 
     @property
@@ -436,19 +505,40 @@ class _PendingPayload:
     def exhausted(self) -> bool:
         return self._pos >= self.max_bits
 
-    def next_logical_bits(self) -> dict[int, int] | None:
-        """Return the next {channel: bit} dict and advance position.
-
-        Returns None when all bits have been drained.
-        """
+    def peek_logical_bits(self) -> dict[int, int] | None:
+        """Return the next {channel: bit} dict without advancing position."""
         if self.exhausted:
             return None
         pos = self._pos // self.repetitions
-        self._pos += 1
         result = {}
         for c in range(5):
             bits = self.channel_bits.get(c, [])
             result[c] = bits[pos] if pos < len(bits) else 0
+        return result
+
+    def advance(self) -> None:
+        """Mark the current logical-bit tuple as successfully embedded."""
+        if not self.exhausted:
+            self._pos += 1
+
+    def should_defer(self) -> bool:
+        """Return True while this payload should wait for more carrier rows."""
+        return self.rows_seen < self.start_after_rows
+
+    def note_row(self) -> None:
+        """Record that one eligible carrier row was considered."""
+        self.rows_seen += 1
+
+    def next_logical_bits(self) -> dict[int, int] | None:
+        """Return the next {channel: bit} dict and advance position.
+
+        Kept for tests and legacy callers.  V9 row-level gating uses
+        ``peek_logical_bits`` + ``advance`` so skipped rows do not consume
+        payload capacity.
+        """
+        result = self.peek_logical_bits()
+        if result is not None:
+            self.advance()
         return result
 
 
@@ -513,6 +603,7 @@ class GhostAuditInterceptor:
         siem_export_path: str | None = None,
         siem_export_format: str = "jsonl",
         metronome_interval: int = 0,
+        temporal_delay_rows: int = 6,
         external_state_path: str | None = None,
         force_reinit: bool = False,
     ):
@@ -547,6 +638,7 @@ class GhostAuditInterceptor:
         self._calibrated = False
         self._payload_queue: list[_PendingPayload] = []
         self._completed_payloads: list[_PendingPayload] = []
+        self._temporal_delay_rows = max(0, temporal_delay_rows)
         self._row_id_list: list[Any] = []
         self._row_id_index: dict[Any, int] = {}
         self._carrier_rows_loaded = False
@@ -614,9 +706,47 @@ class GhostAuditInterceptor:
             print(f"[V9 CALIBRATE] Fitted on {len(texts)} rows from '{cfg.table}'")
         return self
 
+    def measure_text_shape_coverage(self, sample_size: int = 5000) -> dict[str, Any]:
+        """Estimate how often TextShapeCarrier can safely write on this corpus.
+
+        Returns a small stats dict so Problem 2 can be validated empirically
+        before we commit to a larger row budget.
+        """
+        cfg = self.config
+        cursor = self._engine.conn.cursor()
+        cursor.execute(
+            f"SELECT {cfg.semantic_field} FROM {cfg.table} "
+            f"ORDER BY RANDOM() LIMIT ?",
+            (sample_size,),
+        )
+        texts = [row[0] for row in cursor.fetchall() if row[0] is not None]
+        eligible = sum(1 for text in texts if TextShapeCarrier.encode_bit(text, 0).written)
+        total = len(texts)
+        ratio = (eligible / total) if total else 0.0
+        stats = {
+            "sample_size": total,
+            "eligible": eligible,
+            "coverage_ratio": ratio,
+            "carrier_family": "text_shape_oxford",
+        }
+        if self.verbose:
+            print(
+                f"[V9 TEXT-SHAPE] eligible={eligible}/{total} "
+                f"coverage={ratio:.3f} on '{cfg.table}'"
+            )
+        return stats
+
     # ------------------------------------------------------------------ intercept API
 
     def intercept(self, row_id: Any, fields: dict[str, Any]) -> dict[str, Any]:
+        """Compatibility wrapper returning only modified fields.
+
+        Use ``intercept_result`` when callers need to distinguish passthrough,
+        header rows, unknown rows, and carrier-gating skips.
+        """
+        return self.intercept_result(row_id, fields).fields
+
+    def intercept_result(self, row_id: Any, fields: dict[str, Any]) -> InterceptResult:
         """Apply the next pending stego logical-bit-tuple to a field dict.
 
         Called by the application *before* its own UPDATE statement.
@@ -635,37 +765,42 @@ class GhostAuditInterceptor:
         fields : dict
             Current field values the application intends to write.
 
-        Returns
-        -------
-        dict
-            Modified field values to pass to the single UPDATE statement.
+        Profile data may decide whether a carrier may write, but decoding must
+        not depend on that profile.  Opportunistic carriers therefore imply
+        opportunistic row selection: if TextShape cannot safely write on this
+        row, the pending payload position is not consumed.
         """
         if not self._payload_queue:
-            return dict(fields)
+            return InterceptResult(dict(fields), False, "no_pending_payload", row_id)
 
         if self.config.table != "sys_cache":
             self._ensure_carrier_rows()
             row_idx = self._row_id_index.get(row_id)
             if row_idx is None:
-                return dict(fields)
+                return InterceptResult(dict(fields), False, "unknown_row", row_id)
             if (row_idx % self.config.slot_size) < self.config.header_row_count:
-                return dict(fields)
+                return InterceptResult(dict(fields), False, "header_row", row_id)
 
         payload = self._payload_queue[0]
-        logical_bits = payload.next_logical_bits()
 
-        if logical_bits is None or payload.exhausted:
+        if payload.should_defer():
+            payload.note_row()
+            return InterceptResult(dict(fields), False, "temporal_delay", row_id)
+
+        logical_bits = payload.peek_logical_bits()
+
+        if logical_bits is None:
             # This payload is done.  Defer the header write until the app has
             # committed its carrier-row updates, avoiding SQLite write-lock
             # conflicts with the caller's transaction.
             completed = self._payload_queue.pop(0)
             self._completed_payloads.append(completed)
             if not self._payload_queue:
-                return dict(fields)
+                return InterceptResult(dict(fields), False, "payload_completed", row_id)
             payload = self._payload_queue[0]
-            logical_bits = payload.next_logical_bits()
+            logical_bits = payload.peek_logical_bits()
             if logical_bits is None:
-                return dict(fields)
+                return InterceptResult(dict(fields), False, "payload_completed", row_id)
 
         result = dict(fields)
         mapping = self._engine._get_row_carrier_mapping(row_id)
@@ -693,7 +828,17 @@ class GhostAuditInterceptor:
                     )
             elif physical_carrier == 2:
                 if sem in result and result[sem] is not None:
-                    result[sem] = StegoEngine.encode_bit_trailing_space(result[sem], bit)
+                    encoded = TextShapeCarrier.encode_bit(result[sem], bit)
+                    if not encoded.written:
+                        return InterceptResult(
+                            dict(fields), False,
+                            f"carrier_gating:{encoded.reason}", row_id
+                        )
+                    result[sem] = encoded.text
+                else:
+                    return InterceptResult(
+                        dict(fields), False, "carrier_gating:missing_text", row_id
+                    )
             elif physical_carrier == 3:
                 if fb in result and result[fb] is not None:
                     result[fb] = StegoEngine.encode_bit_float_lsb(
@@ -705,12 +850,14 @@ class GhostAuditInterceptor:
                         result[til], bit, row_id=row_id
                     )
 
+        payload.advance()
+
         # If this was the last bit, queue the header for a later flush.
         if payload.exhausted:
             completed = self._payload_queue.pop(0)
             self._completed_payloads.append(completed)
 
-        return result
+        return InterceptResult(result, result != fields, "embedded", row_id)
 
     def flush_headers(self) -> None:
         """Write headers for payloads whose bits have fully been embedded."""
@@ -761,15 +908,45 @@ class GhostAuditInterceptor:
     def decode_row(self, row_id: Any, fields: dict[str, Any]) -> dict[int, int]:
         """Decode all 5 logical channel bits from a carrier row's field values.
 
-        Returns {logical_channel: bit} dict (same as V7's _decode_all_columns_shuffled).
+        Returns {logical_channel: bit} dict.  V9 uses TextShape for physical
+        carrier 2, replacing V7's trailing-space carrier.
         """
-        return self._engine._decode_all_columns_shuffled(
+        return self._decode_all_columns_v9(
             row_id,
             fields.get(self.config.semantic_field, ""),
             fields.get(self.config.float_a_field, 0.0),
             fields.get(self.config.float_b_field, 0.0),
             fields.get(self.config.tilde_field, ""),
         )
+
+    def _decode_all_columns_v9(
+        self,
+        row_id: Any,
+        bio: str,
+        score: float,
+        profile_score: float = 0.0,
+        avatar_url: str = "",
+    ) -> dict[int, int | None]:
+        mapping = self._engine._get_row_carrier_mapping(row_id)
+        logical_bits: dict[int, int | None] = {}
+
+        for physical_carrier in range(5):
+            logical_ch = mapping[physical_carrier]
+            if physical_carrier == 0:
+                bit = (self._calibrator.decode_bit(bio)
+                       if self._calibrated
+                       else StegoEngine.decode_bit_semantic(bio))
+            elif physical_carrier == 1:
+                bit = StegoEngine.decode_bit_float_lsb(score)
+            elif physical_carrier == 2:
+                bit = TextShapeCarrier.decode_bit(bio)
+            elif physical_carrier == 3:
+                bit = StegoEngine.decode_bit_float_lsb(profile_score)
+            else:
+                bit = StegoEngine.decode_bit_avatar_url(avatar_url or "", row_id=row_id)
+            logical_bits[logical_ch] = bit
+
+        return logical_bits
 
     def pending_event_count(self) -> int:
         """Number of events with bits still waiting to be embedded."""
@@ -839,6 +1016,17 @@ class GhostAuditInterceptor:
         )
         row = cursor.fetchone()
         seq = row[0] if row and row[0] is not None else 0
+        delay_seed = hmac.new(
+            e.k_hmac,
+            f"v9-delay:{seq}:{len(stored)}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()[0]
+        start_after_rows = min(
+            self._temporal_delay_rows,
+            delay_seed % (self._temporal_delay_rows + 1)
+            if self._temporal_delay_rows > 0
+            else 0,
+        )
 
         self._payload_queue.append(
             _PendingPayload(
@@ -848,6 +1036,7 @@ class GhostAuditInterceptor:
                 stored_msg_len=len(stored),
                 compressed=store_compressed,
                 repetitions=repetitions,
+                start_after_rows=start_after_rows,
             )
         )
 
@@ -933,6 +1122,18 @@ class GhostAuditInterceptor:
             if seq == 0 or payload_len == 0:
                 continue
 
+            delay_seed = hmac.new(
+                e.k_hmac,
+                f"v9-delay:{seq}:{payload_len}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()[0]
+            start_after_rows = min(
+                self._temporal_delay_rows,
+                delay_seed % (self._temporal_delay_rows + 1)
+                if self._temporal_delay_rows > 0
+                else 0,
+            )
+
             # ---- Extract payload bits (per-channel) ----
             enc_bit_counts = e._per_channel_rs_encoded_bit_count(payload_len, nsym)
             # _per_channel_rs_encoded_bit_count returns a list [ch0_bits, ch1_bits, ...]
@@ -949,8 +1150,19 @@ class GhostAuditInterceptor:
                 payload_ids,
             )
             payload_rows = {r[0]: r for r in cursor.fetchall()}
+            eligible_payload_ids: list[Any] = []
+            for rid in payload_ids:
+                row = payload_rows.get(rid)
+                if not row:
+                    continue
+                _, bio, _fa, _fb, _til = row
+                if TextShapeCarrier.decode_bit(bio) is not None:
+                    eligible_payload_ids.append(rid)
 
-            repetitions = e._get_dynamic_repetitions(max_bits, len(payload_ids))
+            if start_after_rows > 0:
+                eligible_payload_ids = eligible_payload_ids[start_after_rows:]
+
+            repetitions = e._get_dynamic_repetitions(max_bits, len(eligible_payload_ids))
 
             channel_bits: dict[int, list[int]] = {c: [] for c in range(5)}
 
@@ -958,14 +1170,14 @@ class GhostAuditInterceptor:
                 votes: dict[int, list[int]] = {c: [] for c in range(5)}
                 for rep in range(repetitions):
                     row_pos = bit_idx * repetitions + rep
-                    if row_pos >= len(payload_ids):
+                    if row_pos >= len(eligible_payload_ids):
                         break
-                    rid = payload_ids[row_pos]
+                    rid = eligible_payload_ids[row_pos]
                     row = payload_rows.get(rid)
                     if not row:
                         continue
                     _, bio, fa, fb, til = row
-                    logical = e._decode_all_columns_shuffled(rid, bio, fa, fb, til)
+                    logical = self._decode_all_columns_v9(rid, bio, fa, fb, til)
                     for c in range(5):
                         v = logical.get(c)
                         if v is not None:

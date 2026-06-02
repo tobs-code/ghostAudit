@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.carrier_config import CarrierConfig, v7_default_config
 from core.ghost_audit_v9 import (
     SemanticCalibrator,
+    TextShapeCarrier,
     GhostAuditInterceptor,
     _PendingPayload,
     _encode_bit_into_fields,
@@ -42,6 +43,7 @@ def _tmpdir():
 
 def _make_ga(tmpdir: str, **kwargs) -> GhostAuditInterceptor:
     db = os.path.join(tmpdir, "test.db")
+    kwargs.setdefault("temporal_delay_rows", 0)
     return GhostAuditInterceptor(
         db_path=db,
         carrier_config=v7_default_config(),
@@ -120,6 +122,30 @@ def test_calibrator_no_keyword_unchanged():
     cal = SemanticCalibrator()
     cal.fit(["hello world"] * 10)
     assert cal.encode_bit("hello world", 1) == "hello world"
+
+
+# ---------------------------------------------------------------------------
+# TextShapeCarrier
+# ---------------------------------------------------------------------------
+
+def test_text_shape_carrier_oxford_roundtrip():
+    base = "She works on auth, billing and analytics."
+    enc0 = TextShapeCarrier.encode_bit(base, 0)
+    enc1 = TextShapeCarrier.encode_bit(base, 1)
+
+    assert enc0.written
+    assert enc1.written
+    assert TextShapeCarrier.decode_bit(enc0.text) == 0
+    assert TextShapeCarrier.decode_bit(enc1.text) == 1
+    assert "billing, and analytics" in enc1.text
+
+
+def test_text_shape_carrier_rejects_unsafe_text():
+    base = "She is currently working on the system."
+    enc = TextShapeCarrier.encode_bit(base, 1)
+    assert not enc.written
+    assert enc.text == base
+    assert TextShapeCarrier.decode_bit(base) is None
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +239,10 @@ def test_intercept_modifies_fields_when_bits_pending():
     try:
         ga = _make_ga(d)
         ga.log_event("event that queues bits")
-        fields = {"bio": "She is currently active.",
+        fields = {"bio": "She is currently active on auth, billing and analytics.",
                   "trust_score": 0.5, "profile_score": 0.6,
                   "avatar_url": "http://x.com"}
-        result = ga.intercept(row_id=1, fields=fields)
+        result = ga.intercept(row_id=100, fields=fields)
         assert result != fields, "intercept() with pending bits must modify fields"
         ga.close()
     finally:
@@ -231,7 +257,7 @@ def test_intercept_drains_queue_over_multiple_calls():
         initial_bits = ga.pending_bit_count()
         assert initial_bits > 0
 
-        fields = {"bio": "Currently working on the system.",
+        fields = {"bio": "Currently working on auth, billing and analytics.",
                   "trust_score": 0.5, "profile_score": 0.5,
                   "avatar_url": "http://x.com"}
 
@@ -244,6 +270,75 @@ def test_intercept_drains_queue_over_multiple_calls():
                 break
             assert now <= prev, "pending_bit_count must not increase"
             prev = now
+
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_intercept_result_reports_carrier_gating_without_consuming_bit():
+    d = _tmpdir()
+    try:
+        ga = _make_ga(d)
+        ga.log_event("event")
+        before = ga.pending_bit_count()
+
+        fields = {"bio": "No safe shape here.",
+                  "trust_score": 0.5, "profile_score": 0.5,
+                  "avatar_url": "http://x.com"}
+        result = ga.intercept_result(row_id=100, fields=fields)
+
+        assert not result.modified
+        assert result.reason.startswith("carrier_gating:")
+        assert result.fields == fields
+        assert ga.pending_bit_count() == before
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_temporal_delay_defers_initial_payload_rows():
+    d = _tmpdir()
+    try:
+        ga = _make_ga(d, temporal_delay_rows=3)
+        chosen = None
+        for msg in ["event-a", "event-bb", "event-ccc", "event-dddd"]:
+            ga.log_event(msg)
+            if ga._payload_queue and ga._payload_queue[0].start_after_rows > 0:
+                chosen = msg
+                break
+            ga._payload_queue.clear()
+            ga._completed_payloads.clear()
+
+        assert chosen is not None, "Need a payload with non-zero temporal delay for this test"
+
+        before = ga.pending_bit_count()
+        fields = {"bio": "She is currently active on auth, billing and analytics.",
+                  "trust_score": 0.5, "profile_score": 0.5,
+                  "avatar_url": "http://x.com"}
+
+        r1 = ga.intercept_result(row_id=100, fields=fields)
+        r2 = ga.intercept_result(row_id=101, fields=fields)
+        assert r1.reason == "temporal_delay"
+        assert r2.reason == "temporal_delay" or r2.reason == "embedded"
+        assert ga.pending_bit_count() <= before
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_text_shape_coverage_reports_empirical_ratio():
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        ga = _make_external_ga(db)
+        stats = ga.measure_text_shape_coverage(sample_size=200)
+
+        assert stats["sample_size"] > 0
+        assert 0.0 <= stats["coverage_ratio"] <= 1.0
+        # Our fixture rows all contain a list-like text shape, so the first-cut
+        # carrier should be broadly eligible.
+        assert stats["coverage_ratio"] > 0.5
 
         ga.close()
     finally:
@@ -277,18 +372,18 @@ def test_calibration_shifts_synonym_distribution():
         # Inject skewed bio texts into sys_cache so calibrate() picks them up
         conn = ga._engine.conn
         conn.execute("PRAGMA journal_mode=WAL")
-        # Update a sample of sys_cache rows with biased bios
+        # Update enough rows with biased bios so the sample is deterministic.
         bios_dominant = "She is currently working on the platform." * 1
         bios_rare     = "She is presently working on the system." * 1
-        rows = conn.execute("SELECT id FROM sys_cache LIMIT 80").fetchall()
+        rows = conn.execute("SELECT id FROM sys_cache").fetchall()
         ga._engine._set_sys_cache_write_mode(True)
         for i, (rid,) in enumerate(rows):
-            bio = bios_dominant if i < 64 else bios_rare
+            bio = bios_dominant if i < int(len(rows) * 0.8) else bios_rare
             conn.execute("UPDATE sys_cache SET bio=? WHERE id=?", (bio, rid))
         conn.commit()
         ga._engine._set_sys_cache_write_mode(False)
 
-        ga.calibrate(sample_size=80)
+        ga.calibrate(sample_size=len(rows))
         assert ga._calibrated
 
         # After calibration, dominant pair for index 0 should be 0 ('currently')
@@ -367,11 +462,11 @@ def _make_app_db(tmpdir: str) -> str:
     import random
     rng = random.Random(42)
     bios = [
-        "She is currently working on backend services.",
-        "He is presently active on the main platform.",
-        "The system is currently operating at full capacity.",
-        "User is online and working on the deployment pipeline.",
-        "Currently focused on database migration tasks.",
+        "She is currently working on auth, billing and analytics.",
+        "He is presently active on search, storage and sync.",
+        "The system is currently operating across api, cache and workers.",
+        "User is online and working on deploys, metrics and alerts.",
+        "Currently focused on database, indexing and migration tasks.",
     ]
     rows = []
     for i in range(1, 1601):  # 1 full slot
@@ -402,6 +497,7 @@ def _make_external_ga(db_path: str) -> GhostAuditInterceptor:
         carrier_config=cfg,
         force_reinit=True,
         verbose=False,
+        temporal_delay_rows=6,
     )
 
 
@@ -558,12 +654,16 @@ if __name__ == "__main__":
         test_calibrator_fit_and_roundtrip,
         test_calibrator_unfitted_no_crash,
         test_calibrator_no_keyword_unchanged,
+        test_text_shape_carrier_oxford_roundtrip,
+        test_text_shape_carrier_rejects_unsafe_text,
         test_pending_payload_drains_correctly,
         test_encode_decode_bit_roundtrip,
         test_intercept_no_pending_passthrough,
         test_intercept_does_not_write_db,
         test_intercept_modifies_fields_when_bits_pending,
         test_intercept_drains_queue_over_multiple_calls,
+        test_intercept_result_reports_carrier_gating_without_consuming_bit,
+        test_text_shape_coverage_reports_empirical_ratio,
         test_pending_event_count,
         test_calibration_shifts_synonym_distribution,
         test_v7_passthrough_log_and_recover,
