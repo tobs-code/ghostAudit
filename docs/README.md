@@ -545,7 +545,6 @@ docs/
 ├── README_GHOST_AUDIT.md      Ausführliche Vorgänger-Dokumentation
 ├── QUICK_REFERENCE.md         Kurzbefehle auf einen Blick
 ├── TEST_SUITE_OVERVIEW.md     Testfluss und Interpretation
-├── security_research_report.md Vergleich mit Trillian, Sigstore, immudb, QLDB
 └── HARDWARE_CARRIER_TEST.md   FileCarrier-Architektur
 
 analysis/                      Sweep-Runner, Kapazitätsanalyse, Steganalyse

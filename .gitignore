@@ -26,6 +26,10 @@ resilience_metrics*.json
 sweep_wipe_v8_results.json
 gradual_decay_ramp_results.csv
 
+# Internal / tool-specific docs not for public release
+docs/subagent_report.md
+docs/security_research_report.md
+
 # Subdirectories that contain only generated output
 reports/
 security_test_results/
