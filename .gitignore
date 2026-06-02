@@ -1,0 +1,51 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# ── GhostAudit runtime artefacts ─────────────────────────────────────────────
+# SQLite databases (created at runtime)
+*.db
+*.db-shm
+*.db-wal
+*.db.backup
+
+# External rollback-detection state files
+*.evolve
+*.evolve.tmp
+
+# ── Generated reports & metrics ──────────────────────────────────────────────
+# Root-level output files produced by test runs
+attack_simulation_report*.json
+resilience_metrics*.json
+sweep_wipe_v8_results.json
+gradual_decay_ramp_results.csv
+
+# Subdirectories that contain only generated output
+reports/
+security_test_results/
+sweep_param_runs/
+
+# ── Test / type-check caches ─────────────────────────────────────────────────
+.mypy_cache/
+.pytest_cache/
+
+# ── Editor & IDE ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Tool-specific directories ─────────────────────────────────────────────────
+.mavis/
+.opencode/
+.kiro/
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

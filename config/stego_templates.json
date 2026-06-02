@@ -1,0 +1,18 @@
+{
+  "000": {
+    "template": "{adverb} {verb} as a {role}.",
+    "variants": {
+      "adverb": ["Currently", "Presently"],
+      "verb": ["working", "active"],
+      "role": ["developer", "engineer"]
+    }
+  },
+  "001": {
+    "template": "{adverb} {verb} on {focus}.",
+    "variants": {
+      "adverb": ["Currently", "Presently"],
+      "verb": ["focusing", "working"],
+      "focus": ["backend systems", "distributed platforms"]
+    }
+  }
+}
