@@ -95,7 +95,12 @@ ga = GhostAuditInterceptor(
     carrier_config=carrier,
     secret_key=my_key,
     verbose=False,
+    target_spread_factor=10.0, # (V9.1) Streckfaktor relativ zum Event-Intervall
+    max_queue_size=100,        # (V9.2) Schutz vor RAM-Exhaustion (pro Prozess!)
 )
+```
+
+> **Hinweis zu Multi-Process Deployments:** In Umgebungen mit mehreren Workern (z.B. Gunicorn) führt jeder Prozess eine eigene In-Memory Queue. Die effektive Gesamtkapazität ist `max_queue_size * num_workers`. Die Persistenz in SQLite sorgt dafür, dass jeder Worker seinen Teil der Audit-Last unabhängig und crash-sicher abarbeitet.
 
 ga.calibrate()  # optional: Synonym-Verteilung aus echten Rows lernen
 ```
@@ -132,8 +137,10 @@ SQLite-Datenbank
     │       └── Jede Zeile kodiert alle 5 logischen Streams gleichzeitig (V8 Multiplexing)
     │           {Data0, Data1, Data2, P-Parity, Q-Parity} via HMAC-Permutation auf 5 Carrier
     │
-    ├── sys_cache_manifest   ← Row-MACs (5×8 Byte pro Zeile)
-    ├── sys_channel_quality  ← EMA-Degradationshistorie pro Kanal
+    ├── sys_cache_manifest    ← Row-MACs (5×8 Byte pro Zeile)
+    ├── sys_cache_pending_queue ← Persistente ECC-Bits (V9.1)
+    ├── sys_cache_scheduler_state ← Persistente EMA-Raten (V9.1)
+    ├── sys_channel_quality   ← EMA-Degradationshistorie pro Kanal
     ├── merkle_anchor        ← kryptographische Slot-Fingerabdrücke
     ├── event_mac_tags       ← per-Event HMAC-Tags
     └── fs_key_state         ← Forward-Secrecy evolve_count
@@ -169,11 +176,21 @@ Fünf physische Carrier, per HMAC-Permutation pro Zeile auf logische Kanäle gem
 
 **Carrier-Shuffling:** Die Zuordnung physischer Carrier zu logischen Kanälen wechselt per HMAC pro Zeile. Ein Angriff auf einen physischen Carrier verteilt den Schaden gleichmäßig auf alle 5 logischen Kanäle (~20% pro Kanal).
 
+**Adaptive Probability Scheduler (V9.1):** Um zeitliche Korrelationen zwischen Audit-Events und Carrier-Writes zu unterdrücken, misst der Interceptor via EMA die App-Schreibfrequenz und das Event-Intervall. Die Embedding-Wahrscheinlichkeit $p$ wird dynamisch so angepasst, dass Payloads über einen längeren Zeitraum (`target_spread_factor`) gestreckt werden.
+
+**Persistent Queue Manager (V9.1):** Die `_payload_queue` und der Scheduler-State werden in SQLite persistiert. Audit-Events überleben dadurch Prozess-Restarts ohne Bit-Verlust (Zero-Loss-Integrity).
+
+**Reject-New Overflow Strategy (V9.2):** Bei Erreichen der `max_queue_size` werden neue Events mit einem `QueueOverflowError` abgelehnt und ein `SYSTEM_WARNING` im sichtbaren Log erzeugt. Dies verhindert, dass Angreifer alte Events durch Bursts aus der Queue drängen (Anti-History-Flushing).
+
+**Thread-Safety (V9.2):** Der Interceptor ist durch ein internes `threading.Lock` gegen Race-Conditions in Multi-Threaded-Umgebungen (WSGI/ASGI) geschützt.
+
 **Bio-SPOF Fix (V8):** Carrier 3 war ursprünglich Case-Switching auf `bio`. ORM-Normalisierung hätte damit 3/5 Carrier gleichzeitig zerstört. `profile_score` ist eine unabhängige Float-Spalte — Bio-Normalize killt jetzt nur noch 2/5 Carrier.
 
 **TextShapeCarrier (V9):** Der frühere Trailing-Space-Carrier wurde im V9-Payload-Pfad durch einen opportunistischen Textform-Carrier ersetzt. Er schreibt nur auf Rows mit sicherer, lokal decodierbarer Textform; andernfalls wird die Row per row-level gating übersprungen und das pending Payload-Bit nicht verbraucht.
 
 **Temporal Delay (V9):** Payloads starten nicht immer sofort auf der ersten elegiblen Row. Ein kleiner deterministischer `temporal_delay_rows`-Puffer glättet den direkten `log_event()` → `intercept()`-Pfad, damit das Schreibmuster weniger eng an einzelne Audit-Events gebunden ist.
+
+**Float Warm-up (V9):** Float-LSB-Carrier können optional erst nach `float_warmup_samples` echten Werten aktiviert werden. `calibrate_floats()` lädt die Baseline, `measure_float_coverage()` zeigt den aktuellen Warm-up-Stand.
 
 ---
 
@@ -208,6 +225,7 @@ Von innen nach außen:
 - Vollständig eingebettete Payloads werden später per `flush_headers()` bzw. automatisch vor `recover_events()` mit V7-Headern versehen
 - Synonym-Encoding kann via `calibrate()` aus echten Rows an die lokale Textverteilung angepasst werden
 - V7 ECC/RAID-6, HMAC-Shuffling, Merkle, Rollback-Schutz und Checkpoints bleiben als Engine-Primitiven erhalten
+- **V9.1+:** Adaptive Probability Scheduler, persistente Queue, Reject-New Overflow-Schutz und Thread-Safety.
 
 ### V8 — Multiplexing & RAID-6
 
@@ -369,6 +387,40 @@ Ein Inclusion Proof (O(log n) Sibling-Hashes pro Event) wäre nur dann stärker,
 - Jeder `log_event()` speichert `HMAC(k_hmac, seq + event_msg)` in `event_mac_tags`
 - `verify_event_mac(seq)` / `verify_all_event_macs()` für feingranulare Verifikation
 - Ergänzt Merkle-Root: Merkle sagt *dass* etwas geändert wurde, MAC-Tags sagen *welches* Event
+
+### V9.2 — Active-Analyst Test Suite
+
+V9.2 erweitert das Threat-Model um einen **aktiven Analysten** mit Schreibrechten, der gezielt Carrier-Rows manipuliert, um die Reaktion des Systems zu provozieren. Die Test-Suite in [`tests/test_v9_active_analyst.py`](file:///c:/Users/tobs/.cursor/workspace/err/tests/test_v9_active_analyst.py) deckt fünf Angriffsvektoren ab:
+
+| Vektor | Angriff | Erwartete Reaktion |
+|--------|---------|--------------------|
+| **A** — Probe & Tamper | Analyst flippt Bits in `trust_score` (5% der Rows) | RS+RAID-6 toleriert Verlust, Recovery findet Event |
+| **B** — Column Wipe | Analyst setzt `trust_score = 0.0` für alle Rows | RAID-6 P+Q kompensiert 1/5 Kanal-Verlust |
+| **C** — Timing & Correlation | Analyst beobachtet Schreib-Bursts nach `log_event()` | Adaptive Scheduler streut Writes (siehe V9.1) |
+| **D** — Forensic Injection | Analyst injiziert Tilde-Noise in `avatar_url` | HMAC-shuffled Positionen verhindern Decodierung |
+| **E** — Erasure Challenge | Analyst löscht 15% der Carrier-Rows | RS+RAID-6 toleriert Erasures bis zur Kapazitätsgrenze |
+
+**Ausführen:**
+
+```bash
+python tests/test_v9_active_analyst.py
+```
+
+**Erwartete Ausgabe:**
+
+```
+=== Running Active Analyst Threat Model Tests ===
+  PASS Vector A: Embedding + Tampering completed
+  PASS Vector B: Column Wipe completed
+  PASS Vector C: Timing Correlation check completed
+  PASS Vector D: Forensic Injection completed
+  PASS Vector E: Erasure Challenge completed
+=== All Active Analyst Tests Passed ===
+```
+
+**Architektur-Implikation:** Die Tests verwenden `ga._engine.conn` direkt für Datenbank-Manipulationen, um Transaktionsisolierung mit dem Interceptor zu gewährleisten. Separate `sqlite3.connect()`-Verbindungen können in WAL-Mode zu Konflikten mit dem `_write_gate` führen.
+
+**Manifest-Integrität:** Die `_sys_cache_row_mac`-Funktion in [`ghost_audit_v9.py`](file:///c:/Users/tobs/.cursor/workspace/err/core/ghost_audit_v9.py) hasht 5 separate 8-Byte-MACs direkt über die rohen Carrier-Feldwerte (mit 6-stelliger Float-Rundung), sodass das Manifest konsistent bleibt, auch wenn die Carrier-Rows durch steganografische Operationen modifiziert werden.
 
 ---
 

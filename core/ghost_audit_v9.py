@@ -40,10 +40,13 @@ import hmac
 import json
 import os
 import re
+import random
+import time
+import threading
 import sqlite3
 import struct
 import zlib
-from typing import Any
+from typing import Any, NamedTuple
 
 from core.carrier_config import CarrierConfig, v7_default_config
 from core.ghost_audit_v7 import GhostAuditV7, StegoEngine
@@ -64,6 +67,11 @@ class InterceptResult:
     modified: bool
     reason: str = ""
     row_id: Any = None
+
+
+class QueueOverflowError(RuntimeError):
+    """Raised when the pending stego queue is full and cannot accept new events."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +97,178 @@ class _V9Engine(GhostAuditV7):
     _carrier_config: "CarrierConfig | None" = None
 
     def __init__(self, *args, **kwargs):
+        # Extract params needed before super().__init__
+        self.force_reinit = kwargs.get("force_reinit", False)
+        self.verbose = kwargs.get("verbose", False)
+
+        # Pop slot_size / slot_count — GhostAuditV7 does not accept them,
+        # they are class-level constants on V7 and we set them on the
+        # instance *after* super().__init__ to override the defaults.
+        self._init_slot_size = kwargs.pop("slot_size", None)
+        self._init_slot_count = kwargs.pop("slot_count", None)
+
         # Patch AUX_TABLE on the *instance* before super().__init__ calls
         # _setup_db, so every table reference inside _setup_db is correct.
         if type(self)._external_carrier and type(self)._carrier_config:
             self.AUX_TABLE = type(self)._carrier_config.table
+
+        # Initialize float_scale BEFORE super().__init__ because super().__init__
+        # calls _setup_db -> _rebuild_sys_cache_manifest -> _decode_channel_bit.
+        self.float_scale = 1000000
+        self.semantic_calibrator = None # Set by Interceptor
         super().__init__(*args, **kwargs)
 
+        # Apply the slot configuration that the caller (Interceptor) requested.
+        if self._init_slot_size is not None:
+            self.SLOT_SIZE = self._init_slot_size
+        if self._init_slot_count is not None:
+            self.SLOT_COUNT = self._init_slot_count
+
+    def _decode_channel_bit(self, channel: int, bio: str, score: float,
+                            profile_score: float = 0.0, avatar_url: str = ""):
+        """Decode a bit from physical carrier (0-4), matching V9 carriers."""
+        if channel == 0:      # Data: Semantic (bio synonym switching)
+            if self.semantic_calibrator and self.semantic_calibrator._fitted:
+                bit = self.semantic_calibrator.decode_bit(bio)
+                return bit if bit is not None else 0
+            return StegoEngine.decode_bit_semantic(bio)
+        elif channel == 1:    # Data: Float-LSB (trust_score)
+            return StegoEngine.decode_bit_float_lsb(score, scale=self.float_scale)
+        elif channel == 2:    # Data: TextShape (Oxford Comma)
+            bit = TextShapeCarrier.decode_bit(bio)
+            return bit if bit is not None else 0
+        elif channel == 3:    # P Parity: Float-LSB (profile_score)
+            return StegoEngine.decode_bit_float_lsb(profile_score, scale=self.float_scale)
+        elif channel == 4:    # Q Parity: Avatar Tilde (~)
+            return StegoEngine.decode_bit_avatar_url(avatar_url, row_id=0)
+        raise ValueError(f"Unknown channel: {channel}")
+
+    def _encode_channel_bit(self, channel: int, bio: str, score: float, bit: int,
+                            row_id=None, profile_score: float = 0.0,
+                            avatar_url: str = ""):
+        """Encode a bit to physical carrier (0-4), matching V9 carriers."""
+        if channel == 0:      # Data: Semantic (bio)
+            return StegoEngine.encode_bit_semantic(bio, bit), score, profile_score, avatar_url
+        elif channel == 1:    # Data: Float-LSB (trust_score)
+            return bio, StegoEngine.encode_bit_float_lsb(score, bit, row_id=row_id, scale=self.float_scale), profile_score, avatar_url
+        elif channel == 2:    # Data: TextShape (Oxford Comma)
+            res = TextShapeCarrier.encode_bit(bio, bit)
+            return res.text, score, profile_score, avatar_url
+        elif channel == 3:    # P Parity: Float-LSB (profile_score)
+            return bio, score, StegoEngine.encode_bit_float_lsb(profile_score, bit, row_id=row_id, scale=self.float_scale), avatar_url
+        elif channel == 4:    # Q Parity: Avatar Tilde (~) (avatar_url)
+            return bio, score, profile_score, StegoEngine.encode_bit_avatar_url(avatar_url, bit, row_id=row_id)
+        raise ValueError(f"Unknown channel: {channel}")
+
+    def _sys_cache_row_mac(self, row_id, bio, score, profile_score=0.0, avatar_url=""):
+        """V9: Calculate 5 separate 8-Byte MACs over raw carrier field values."""
+        
+        # Slot-based key for MAC calculation
+        slot_idx = self._get_slot_idx_for_row(row_id)
+        _, k_hm = self._get_slot_keys(slot_idx)
+        
+        # Round floats to a fixed precision to ensure consistent serialization,
+        # mitigating floating-point representation issues across reads/writes.
+        rounded_score = round(float(score), 6)
+        rounded_profile_score = round(float(profile_score), 6)
+        
+        # Serialize raw field values consistently
+        import struct
+        data_to_mac_base = struct.pack(">I", row_id)
+        data_to_mac_base += bio.encode('utf-8') if bio is not None else b''
+        data_to_mac_base += struct.pack(">d", rounded_score) # double for float
+        data_to_mac_base += struct.pack(">d", rounded_profile_score) # double for float
+        data_to_mac_base += avatar_url.encode('utf-8') if avatar_url is not None else b''
+        
+        blob = b""
+        for c in range(5): # Iterate for each of the 5 logical channels
+            # Include the channel index in the data to MAC to make each MAC unique
+            data_for_channel_mac = data_to_mac_base + struct.pack(">B", c)
+            mac = hmac.new(
+                k_hm,
+                data_for_channel_mac,
+                hashlib.sha256
+            ).digest()[:8] # Truncate to 8 bytes as per original design
+            blob += mac
+            
+        return blob
+
+    def _rebuild_sys_cache_manifest(self):
+        """Override V7 manifest rebuild to use V9 CarrierConfig fields."""
+        if not self._external_carrier or not self._carrier_config:
+            super()._rebuild_sys_cache_manifest()
+            return
+
+        cfg = self._carrier_config
+        cursor = self.conn.cursor()
+        
+        self._set_sys_cache_write_mode(True, commit=False)
+        try:
+            cursor.execute(f"DELETE FROM {self.AUX_MANIFEST_TABLE}")
+            
+            # Select using V9 configured field names
+            cursor.execute(
+                f"SELECT {cfg.id_field}, {cfg.semantic_field}, {cfg.float_a_field}, "
+                f"{cfg.float_b_field}, {cfg.tilde_field} "
+                f"FROM {cfg.table} ORDER BY {cfg.id_field} ASC"
+            )
+            
+            manifest_rows = []
+            for row in cursor.fetchall():
+                row_id, bio, fa, fb, til = row
+                if bio is None or fa is None:
+                    continue
+                
+                manifest_rows.append(
+                    (row_id, self._sys_cache_row_mac(row_id, bio, fa, fb, til))
+                )
+                
+            if manifest_rows:
+                cursor.executemany(
+                    f"INSERT OR REPLACE INTO {self.AUX_MANIFEST_TABLE} (id, row_mac) VALUES (?, ?)",
+                    manifest_rows,
+                )
+            self.conn.commit()
+        finally:
+            self._set_sys_cache_write_mode(False, commit=True)
+
+    def _verify_sys_cache_row(self, row_id, bio, score, profile_score=0.0, avatar_url=""):
+         """Verify the integrity of a sys_cache row using its manifest HMAC."""
+         cursor = self.conn.cursor()
+         cursor.execute(
+             f"SELECT row_mac FROM {self.AUX_MANIFEST_TABLE} WHERE id=?",
+             (row_id,),
+         )
+         res = cursor.fetchone()
+         if not res:
+             return False # In V9, we expect a manifest entry for every row
+         
+         stored_mac = res[0]
+         current_mac = self._sys_cache_row_mac(row_id, bio, score, profile_score, avatar_url)
+         
+         return hmac.compare_digest(stored_mac, current_mac)
+
+    def _write_event_to_slots(self, cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences):
+        """V9: Carrier writes are handled by the Interceptor's intercept() loop.
+        
+        The engine's log_events() path must NOT write directly to the app table
+        to maintain steganographic stealth and avoid uncoordinated updates.
+        """
+        active_seqs = set(seq for _, seq in slot_sequences if seq > 0)
+        active_count = len(active_seqs)
+        max_replicas = max(1, self.SLOT_COUNT // max(1, active_count + 1))
+        replica_count = min(self.REPLICA_COUNT, max_replicas, len(slot_sequences))
+        replica_slots = [slot_idx for slot_idx, _ in slot_sequences[:replica_count]]
+        
+        # We return the slots we WOULD have written to, so V7's sequence tracking
+        # in log_events() remains correct.
+        return replica_slots
+
     def _setup_db(self):
+        # Always ensure V9 tables exist
+        self._create_pending_queue_table()
+        self._create_scheduler_state_table()
+
         if not self._external_carrier:
             # Standard V7 path — synthetic sys_cache, full bootstrap
             super()._setup_db()
@@ -111,6 +284,16 @@ class _V9Engine(GhostAuditV7):
                 (name,),
             )
             return cursor.fetchone() is not None
+
+        if self.force_reinit:
+            if self.verbose:
+                print(f"[V9] Force reinit: dropping internal audit tables.")
+            cursor.execute(f"DROP TABLE IF EXISTS {self.VISIBLE_LOG_TABLE}")
+            cursor.execute(f"DROP TABLE IF EXISTS {self.AUX_MANIFEST_TABLE}")
+            cursor.execute(f"DROP TABLE IF EXISTS {self.DECOY_ARCHIVE_TABLE}")
+            cursor.execute(f"DROP TABLE IF EXISTS {self.MERKLE_ANCHOR_TABLE}")
+            cursor.execute(f"DROP TABLE IF EXISTS sys_cache_write_gate")
+            self.conn.commit()
 
         visible_exists  = _exists(self.VISIBLE_LOG_TABLE)
         manifest_exists = _exists(self.AUX_MANIFEST_TABLE)
@@ -218,6 +401,49 @@ class _V9Engine(GhostAuditV7):
         self._seed_carrier_quality()
         self._set_sys_cache_write_mode(False, commit=True)
 
+    def _create_pending_queue_table(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sys_cache_pending_queue (
+                seq INTEGER PRIMARY KEY,
+                nsym INTEGER NOT NULL,
+                stored_msg_len INTEGER NOT NULL,
+                compressed INTEGER NOT NULL,
+                repetitions INTEGER NOT NULL,
+                start_after_rows INTEGER NOT NULL,
+                rows_seen INTEGER NOT NULL DEFAULT 0,
+                pos_0 INTEGER NOT NULL DEFAULT 0,
+                pos_1 INTEGER NOT NULL DEFAULT 0,
+                pos_2 INTEGER NOT NULL DEFAULT 0,
+                pos_3 INTEGER NOT NULL DEFAULT 0,
+                pos_4 INTEGER NOT NULL DEFAULT 0,
+                channel_bits_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.conn.commit()
+
+    def _create_scheduler_state_table(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sys_cache_scheduler_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                app_write_rate_ema REAL NOT NULL DEFAULT 0.0,
+                avg_event_interval_ema REAL NOT NULL DEFAULT 0.0,
+                last_intercept_time REAL NOT NULL DEFAULT 0.0,
+                last_event_time REAL NOT NULL DEFAULT 0.0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO sys_cache_scheduler_state (id) VALUES (1)"
+        )
+        self.conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # Semantic calibrator
@@ -312,6 +538,58 @@ class SemanticCalibrator:
 
 
 # ---------------------------------------------------------------------------
+# Float calibrator
+# ---------------------------------------------------------------------------
+
+class FloatCalibrator:
+    """Track whether a float carrier has enough real samples to be used.
+
+    In V9, this also performs a distribution fit by finding the scale
+    (precision level) where the natural LSB distribution is closest to 50/50.
+    """
+
+    def __init__(self, min_samples: int = 0):
+        self.min_samples = max(0, min_samples)
+        self.count = 0
+        self.min_seen: float | None = None
+        self.max_seen: float | None = None
+        self.best_scale: int = 1000000  # Default V7 scale
+        self._scales = [1000, 10000, 100000, 1000000, 10000000]
+
+    def fit(self, values: list[float]) -> "FloatCalibrator":
+        for value in values:
+            if value is None:
+                continue
+            self.count += 1
+            self.min_seen = value if self.min_seen is None else min(self.min_seen, value)
+            self.max_seen = value if self.max_seen is None else max(self.max_seen, value)
+
+        if self.count >= 10:
+            # Find scale with best 50/50 LSB distribution
+            best_diff = 1.0
+            best_s = 1000000
+            for s in self._scales:
+                ones = sum(1 for v in values if v is not None and int(round(v * s)) % 2 == 1)
+                ratio = ones / len(values) if values else 0.5
+                diff = abs(ratio - 0.5)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_s = s
+            self.best_scale = best_s
+
+        return self
+
+    @property
+    def ready(self) -> bool:
+        return self.count >= self.min_samples
+
+    def coverage(self) -> float:
+        if self.min_samples <= 0:
+            return 1.0
+        return min(1.0, self.count / float(self.min_samples))
+
+
+# ---------------------------------------------------------------------------
 # Text-shape carrier
 # ---------------------------------------------------------------------------
 
@@ -323,13 +601,14 @@ class TextShapeCarrier:
     bit from the text shape itself; missing/ambiguous shapes are erasures.
     """
 
-    # Narrow first-cut family: Oxford comma in simple three-item lists.
+    # Broadened family: Oxford comma in lists of three items.
+    # Matches items that can contain spaces, but not commas.
     # bit=1: "A, B, and C"; bit=0: "A, B and C".
     _OXFORD_RE = re.compile(
-        r"\b([A-Za-z][A-Za-z0-9_+-]*), "
-        r"([A-Za-z][A-Za-z0-9_+-]*)"
-        r"(,?) and "
-        r"([A-Za-z][A-Za-z0-9_+-]*)\b"
+        r"([A-Za-z0-9][^,]{1,40}), "  # Item 1
+        r"([A-Za-z0-9][^,]{1,40})"   # Item 2
+        r"(,?) and "                 # Potential Oxford Comma
+        r"([A-Za-z0-9][^.]{1,40})"   # Item 3
     )
 
     @classmethod
@@ -366,6 +645,7 @@ def _encode_bit_into_fields(
     bit: int,
     config: CarrierConfig,
     calibrator: SemanticCalibrator | None,
+    float_scale: int = 1000000,
 ) -> dict[str, Any]:
     """Apply a single stego bit to a field dict using all 5 carriers.
 
@@ -386,7 +666,9 @@ def _encode_bit_into_fields(
 
     # carrier 1: float_a LSB
     if fa in result and result[fa] is not None:
-        result[fa] = StegoEngine.encode_bit_float_lsb(result[fa], bit, row_id=row_id)
+        result[fa] = StegoEngine.encode_bit_float_lsb(
+            result[fa], bit, row_id=row_id, scale=float_scale
+        )
 
     # carrier 2: text-shape carrier (same field as semantic)
     if sem in result and result[sem] is not None:
@@ -396,7 +678,9 @@ def _encode_bit_into_fields(
 
     # carrier 3: float_b LSB
     if fb in result and result[fb] is not None:
-        result[fb] = StegoEngine.encode_bit_float_lsb(result[fb], bit, row_id=row_id)
+        result[fb] = StegoEngine.encode_bit_float_lsb(
+            result[fb], bit, row_id=row_id, scale=float_scale
+        )
 
     # carrier 4: tilde suffix
     if til in result and result[til] is not None:
@@ -410,6 +694,7 @@ def _decode_bit_from_fields(
     fields: dict[str, Any],
     config: CarrierConfig,
     calibrator: SemanticCalibrator | None,
+    float_scale: int = 1000000,
 ) -> int | None:
     """Majority-vote decode of one stego bit from a field dict."""
     votes: list[int] = []
@@ -426,7 +711,7 @@ def _decode_bit_from_fields(
             votes.append(b)
 
     if fa in fields and fields[fa] is not None:
-        b = StegoEngine.decode_bit_float_lsb(fields[fa])
+        b = StegoEngine.decode_bit_float_lsb(fields[fa], scale=float_scale)
         if b is not None:
             votes.append(b)
 
@@ -436,7 +721,7 @@ def _decode_bit_from_fields(
             votes.append(b)
 
     if fb in fields and fields[fb] is not None:
-        b = StegoEngine.decode_bit_float_lsb(fields[fb])
+        b = StegoEngine.decode_bit_float_lsb(fields[fb], scale=float_scale)
         if b is not None:
             votes.append(b)
 
@@ -468,21 +753,27 @@ class _PendingPayload:
 
     def __init__(
         self,
-        channel_blocks: dict[int, bytes],
-        seq: int,
-        nsym: int,
-        stored_msg_len: int,
-        compressed: bool,
+        channel_blocks: dict[int, bytes] | None = None,
+        seq: int = 0,
+        nsym: int = 0,
+        stored_msg_len: int = 0,
+        compressed: bool = False,
         repetitions: int = 1,
         start_after_rows: int = 0,
+        channel_bits: dict[int, list[int]] | None = None,
     ):
         # Convert each channel's bytes to a flat bit list
-        self.channel_bits: dict[int, list[int]] = {}
-        for c, data in channel_blocks.items():
-            bits = []
-            for byte_val in data:
-                bits.extend([int(b) for b in format(byte_val, "08b")])
-            self.channel_bits[c] = bits
+        if channel_bits is not None:
+            self.channel_bits = channel_bits
+        elif channel_blocks is not None:
+            self.channel_bits: dict[int, list[int]] = {}
+            for c, data in channel_blocks.items():
+                bits = []
+                for byte_val in data:
+                    bits.extend([int(b) for b in format(byte_val, "08b")])
+                self.channel_bits[c] = bits
+        else:
+            self.channel_bits = {}
 
         self.seq = seq
         self.nsym = nsym
@@ -491,7 +782,7 @@ class _PendingPayload:
         self.repetitions = max(1, repetitions)
         self.start_after_rows = max(0, start_after_rows)
         self.rows_seen = 0
-        self._pos = 0   # current bit position (same for all channels)
+        self._pos = {c: 0 for c in range(5)} # independent pointer per channel
 
     @property
     def source_bit_count(self) -> int:
@@ -503,23 +794,47 @@ class _PendingPayload:
 
     @property
     def exhausted(self) -> bool:
-        return self._pos >= self.max_bits
+        # Exhausted when all channel pointers have reached the end
+        return all(self._pos[c] >= len(self.channel_bits.get(c, [])) * self.repetitions 
+                   for c in range(5))
+
+    @property
+    def remaining_bits(self) -> int:
+        """Total bits remaining to be embedded across all channels."""
+        total = 0
+        for c in range(5):
+            max_bits_ch = len(self.channel_bits.get(c, [])) * self.repetitions
+            total += max(0, max_bits_ch - self._pos[c])
+        return total
+
+    def peek_bit(self, channel: int) -> int:
+        """Return the next bit for a specific channel."""
+        pos = self._pos[channel] // self.repetitions
+        bits = self.channel_bits.get(channel, [])
+        return bits[pos] if pos < len(bits) else 0
 
     def peek_logical_bits(self) -> dict[int, int] | None:
-        """Return the next {channel: bit} dict without advancing position."""
+        """Return the next {channel: bit} tuple without advancing.
+        
+        Used for tests and legacy callers.
+        """
         if self.exhausted:
             return None
-        pos = self._pos // self.repetitions
-        result = {}
-        for c in range(5):
-            bits = self.channel_bits.get(c, [])
-            result[c] = bits[pos] if pos < len(bits) else 0
-        return result
+        return {c: self.peek_bit(c) for c in range(5)}
 
-    def advance(self) -> None:
-        """Mark the current logical-bit tuple as successfully embedded."""
-        if not self.exhausted:
-            self._pos += 1
+    def advance(self, channel: int | None = None) -> None:
+        """Mark the current bit(s) as successfully embedded.
+        
+        If channel is None, advance all channels (legacy behavior).
+        """
+        if channel is not None:
+            max_bits_ch = len(self.channel_bits.get(channel, [])) * self.repetitions
+            if self._pos[channel] < max_bits_ch:
+                self._pos[channel] += 1
+        else:
+            # Legacy: advance all
+            for c in range(5):
+                self.advance(c)
 
     def should_defer(self) -> bool:
         """Return True while this payload should wait for more carrier rows."""
@@ -532,9 +847,7 @@ class _PendingPayload:
     def next_logical_bits(self) -> dict[int, int] | None:
         """Return the next {channel: bit} dict and advance position.
 
-        Kept for tests and legacy callers.  V9 row-level gating uses
-        ``peek_logical_bits`` + ``advance`` so skipped rows do not consume
-        payload capacity.
+        Kept for tests and legacy callers.
         """
         result = self.peek_logical_bits()
         if result is not None:
@@ -549,46 +862,13 @@ class _PendingPayload:
 class GhostAuditInterceptor:
     """V9 interceptor — wraps a GhostAuditV7 engine and exposes the
     intercept API for timing-safe single-write stego embedding.
-
-    Quick start
-    -----------
-    ::
-
-        config = CarrierConfig(
-            table="users",
-            id_field="id",
-            semantic_field="bio",
-            float_a_field="trust_score",
-            float_b_field="profile_score",
-            tilde_field="avatar_url",
-        )
-
-        ga = GhostAuditInterceptor(
-            db_path="app.db",
-            carrier_config=config,
-            secret_key="your-secret-key",
-        )
-
-        # Calibrate synonym encoder from real data (call once at startup)
-        ga.calibrate()
-
-        # Wherever the app updates a carrier row:
-        def update_user(conn, uid, bio, trust, profile, avatar):
-            fields = dict(bio=bio, trust_score=trust,
-                          profile_score=profile, avatar_url=avatar)
-            # GhostAudit may embed stego bits — returns modified fields
-            final = ga.intercept(uid, fields)
-            conn.execute(
-                "UPDATE users SET bio=?, trust_score=?, "
-                "profile_score=?, avatar_url=? WHERE id=?",
-                (final["bio"], final["trust_score"],
-                 final["profile_score"], final["avatar_url"], uid),
-            )
-
-        # Log audit events exactly as in V7
-        ga.log_event("user=alice action=login ip=10.0.0.1")
-        events = ga.recover_events()
     """
+
+    # Conservative fixed estimate for external carrier coverage to ensure
+    # capacity planning and recovery are deterministic.
+    # In Round-Robin mode, each channel only gets 20% of rows.
+    # If 20% of those are eligible (semantic/text_shape), total coverage is 4%.
+    EXTERNAL_COVERAGE_ESTIMATE = 0.04
 
     # ------------------------------------------------------------------ init
 
@@ -604,11 +884,23 @@ class GhostAuditInterceptor:
         siem_export_format: str = "jsonl",
         metronome_interval: int = 0,
         temporal_delay_rows: int = 6,
+        target_spread_factor: float = 10.0,
+        float_warmup_samples: int = 0,
         external_state_path: str | None = None,
         force_reinit: bool = False,
+        max_queue_size: int = 100,
     ):
         self.config = carrier_config or v7_default_config()
         self.verbose = verbose
+        self._target_spread_factor = target_spread_factor
+        self.max_queue_size = max(1, max_queue_size)
+        
+        # Scheduler state
+        self._app_write_rate_ema = 0.0      # app writes per second
+        self._avg_event_interval_ema = 0.0 # seconds between log_event() calls
+        self._last_intercept_time = 0.0
+        self._last_event_time = 0.0
+        self._ema_alpha = 0.1             # smoothing factor
 
         # Determine whether to use external-carrier mode
         is_external = (carrier_config is not None and
@@ -629,23 +921,139 @@ class GhostAuditInterceptor:
             metronome_interval=metronome_interval,
             external_state_path=external_state_path,
             force_reinit=force_reinit,
+            slot_size=self.config.slot_size,
+            slot_count=self.config.slot_count,
         )
+
+        # Ensure the engine uses the same slot configuration as the interceptor
+        self._engine.SLOT_SIZE = self.config.slot_size
+        self._engine.SLOT_COUNT = self.config.slot_count
 
         # Point V7's AUX_TABLE at the configured carrier table
         self._engine.AUX_TABLE = self.config.table
+        
+        # Set busy timeout to prevent "database is locked" in multi-threaded/multi-process environments
+        self._engine.conn.execute("PRAGMA busy_timeout=30000")
 
         self._calibrator = SemanticCalibrator()
+        self._engine.semantic_calibrator = self._calibrator
         self._calibrated = False
+        self._float_calibrator = FloatCalibrator(min_samples=float_warmup_samples)
         self._payload_queue: list[_PendingPayload] = []
         self._completed_payloads: list[_PendingPayload] = []
         self._temporal_delay_rows = max(0, temporal_delay_rows)
+        self._float_warmup_samples = max(0, float_warmup_samples)
         self._row_id_list: list[Any] = []
         self._row_id_index: dict[Any, int] = {}
         self._carrier_rows_loaded = False
+        self._intercept_count = 0
+        self._restarted = True
+        self._lock = threading.RLock()
+
+        # Load persisted state
+        self._load_scheduler_state()
+        self._load_pending_queue()
 
         # For external carrier: populate _orig_ids from real table rows
         if is_external:
             self._ensure_carrier_rows()
+        else:
+            # sys_cache mode: use V7 engine's generated IDs
+            self._row_id_list = list(self._engine._orig_ids)
+            self._row_id_index = {rid: idx for idx, rid in enumerate(self._row_id_list)}
+            self._carrier_rows_loaded = True
+
+    # ------------------------------------------------------------------ persistence
+
+    def _load_scheduler_state(self):
+        cursor = self._engine.conn.cursor()
+        cursor.execute(
+            """
+            SELECT app_write_rate_ema, avg_event_interval_ema, 
+                   last_intercept_time, last_event_time 
+            FROM sys_cache_scheduler_state WHERE id=1
+            """
+        )
+        row = cursor.fetchone()
+        if row:
+            (self._app_write_rate_ema, self._avg_event_interval_ema, 
+             self._last_intercept_time, self._last_event_time) = row
+
+    def _save_scheduler_state(self):
+        cursor = self._engine.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE sys_cache_scheduler_state SET
+                app_write_rate_ema = ?,
+                avg_event_interval_ema = ?,
+                last_intercept_time = ?,
+                last_event_time = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (self._app_write_rate_ema, self._avg_event_interval_ema, 
+             self._last_intercept_time, self._last_event_time)
+        )
+        self._engine.conn.commit()
+
+    def _load_pending_queue(self):
+        cursor = self._engine.conn.cursor()
+        cursor.execute("SELECT * FROM sys_cache_pending_queue ORDER BY seq ASC")
+        rows = cursor.fetchall()
+        cols = [description[0] for description in cursor.description]
+        
+        self._payload_queue = []
+        for row in rows:
+            data = dict(zip(cols, row))
+            # JSON keys are strings, need to convert back to int for channel_bits
+            raw_bits = json.loads(data["channel_bits_json"])
+            ch_bits = {int(k): v for k, v in raw_bits.items()}
+            
+            payload = _PendingPayload(
+                seq=data["seq"],
+                nsym=data["nsym"],
+                stored_msg_len=data["stored_msg_len"],
+                compressed=bool(data["compressed"]),
+                repetitions=data["repetitions"],
+                start_after_rows=data["start_after_rows"],
+                channel_bits=ch_bits
+            )
+            payload.rows_seen = data["rows_seen"]
+            payload._pos = {
+                0: data["pos_0"],
+                1: data["pos_1"],
+                2: data["pos_2"],
+                3: data["pos_3"],
+                4: data["pos_4"]
+            }
+            self._payload_queue.append(payload)
+        
+        if self.verbose and self._payload_queue:
+            print(f"[V9] Loaded {len(self._payload_queue)} pending payloads from DB.")
+
+    def _save_payload(self, payload: _PendingPayload):
+        cursor = self._engine.conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO sys_cache_pending_queue (
+                seq, nsym, stored_msg_len, compressed, repetitions,
+                start_after_rows, rows_seen, pos_0, pos_1, pos_2, pos_3, pos_4,
+                channel_bits_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.seq, payload.nsym, payload.stored_msg_len, int(payload.compressed),
+                payload.repetitions, payload.start_after_rows, payload.rows_seen,
+                payload._pos[0], payload._pos[1], payload._pos[2], payload._pos[3], payload._pos[4],
+                json.dumps({str(k): v for k, v in payload.channel_bits.items()})
+            )
+        )
+        self._engine.conn.commit()
+
+    def _delete_payload(self, seq: int):
+        cursor = self._engine.conn.cursor()
+        cursor.execute("DELETE FROM sys_cache_pending_queue WHERE seq = ?", (seq,))
+        self._engine.conn.commit()
 
     # ------------------------------------------------------------------ carrier row index
 
@@ -658,31 +1066,32 @@ class GhostAuditInterceptor:
 
         This must be called before any intercept/recover operations.
         """
-        if self._carrier_rows_loaded:
-            return
-        cfg = self.config
-        cursor = self._engine.conn.cursor()
-        cursor.execute(
-            f"SELECT {cfg.id_field} FROM {cfg.table} ORDER BY {cfg.id_field}"
-        )
-        rows = cursor.fetchall()
-        self._row_id_list = [r[0] for r in rows]
-        self._row_id_index = {rid: idx for idx, rid in enumerate(self._row_id_list)}
+        with self._lock:
+            if self._carrier_rows_loaded:
+                return
+            cfg = self.config
+            cursor = self._engine.conn.cursor()
+            cursor.execute(
+                f"SELECT {cfg.id_field} FROM {cfg.table} ORDER BY {cfg.id_field}"
+            )
+            rows = cursor.fetchall()
+            self._row_id_list = [r[0] for r in rows]
+            self._row_id_index = {rid: idx for idx, rid in enumerate(self._row_id_list)}
 
-        # Also update the V7 engine's _orig_ids so its ECC/header paths work
-        required = cfg.slot_count * cfg.slot_size
-        if len(self._row_id_list) < required:
-            if self.verbose:
-                print(
-                    f"[V9] Warning: carrier table '{cfg.table}' has "
-                    f"{len(self._row_id_list)} rows, need {required}. "
-                    f"Interception will be limited."
-                )
-        self._engine._orig_ids = self._row_id_list[:required]
-        self._engine._orig_id_to_idx = {
-            rid: idx for idx, rid in enumerate(self._engine._orig_ids)
-        }
-        self._carrier_rows_loaded = True
+            # Also update the V7 engine's _orig_ids so its ECC/header paths work
+            required = cfg.slot_count * cfg.slot_size
+            if len(self._row_id_list) < required:
+                if self.verbose:
+                    print(
+                        f"[V9] Warning: carrier table '{cfg.table}' has "
+                        f"{len(self._row_id_list)} rows, need {required}. "
+                        f"Interception will be limited."
+                    )
+            self._engine._orig_ids = self._row_id_list[:required]
+            self._engine._orig_id_to_idx = {
+                rid: idx for idx, rid in enumerate(self._engine._orig_ids)
+            }
+            self._carrier_rows_loaded = True
 
     # ------------------------------------------------------------------ calibration
 
@@ -700,11 +1109,80 @@ class GhostAuditInterceptor:
             (sample_size,),
         )
         texts = [row[0] for row in cursor.fetchall() if row[0]]
-        self._calibrator.fit(texts)
-        self._calibrated = True
+        
+        # Fit a new instance outside the lock to avoid blocking intercept()
+        new_calibrator = SemanticCalibrator().fit(texts)
+        
+        with self._lock:
+            self._calibrator = new_calibrator
+            self._engine.semantic_calibrator = new_calibrator
+            self._calibrated = True
+            # Rebuild manifest since decoded bits changed
+            if self._engine._external_carrier:
+                self._engine._rebuild_sys_cache_manifest()
+            
         if self.verbose:
             print(f"[V9 CALIBRATE] Fitted on {len(texts)} rows from '{cfg.table}'")
         return self
+
+    def calibrate_floats(self, sample_size: int = 5000) -> "GhostAuditInterceptor":
+        """Warm up float carriers from existing rows.
+
+        This is the first-cut answer to the Float-LSB bootstrap problem:
+        we only enable float writes after seeing enough real values.
+        """
+        cfg = self.config
+        cursor = self._engine.conn.cursor()
+        cursor.execute(
+            f"SELECT {cfg.float_a_field}, {cfg.float_b_field} FROM {cfg.table} "
+            f"ORDER BY RANDOM() LIMIT ?",
+            (sample_size,),
+        )
+        vals: list[float] = []
+        for a, b in cursor.fetchall():
+            if a is not None:
+                vals.append(float(a))
+            if b is not None:
+                vals.append(float(b))
+        
+        # Fit a new instance outside the lock to avoid blocking intercept()
+        new_float_calibrator = FloatCalibrator(
+            min_samples=self._float_warmup_samples
+        ).fit(vals)
+        
+        with self._lock:
+            self._float_calibrator = new_float_calibrator
+            # Sync scale to engine for MAC calculation
+            self._engine.float_scale = new_float_calibrator.best_scale
+            # Rebuild manifest since decoded bits changed
+            if self._engine._external_carrier:
+                self._engine._rebuild_sys_cache_manifest()
+            
+        if self.verbose:
+            print(
+                f"[V9 FLOAT-CAL] fitted {self._float_calibrator.count} values "
+                f"from '{cfg.table}'"
+            )
+        return self
+
+    def measure_float_coverage(self) -> dict[str, Any]:
+        """Return the current warm-up coverage for float carriers."""
+        stats = {
+            "count": self._float_calibrator.count,
+            "min_samples": self._float_calibrator.min_samples,
+            "ready": self._float_calibrator.ready,
+            "coverage_ratio": self._float_calibrator.coverage(),
+            "min_seen": self._float_calibrator.min_seen,
+            "max_seen": self._float_calibrator.max_seen,
+            "best_scale": self._float_calibrator.best_scale,
+        }
+        if self.verbose:
+            print(
+                f"[V9 FLOAT] count={stats['count']} "
+                f"coverage={stats['coverage_ratio']:.3f} ready={stats['ready']} "
+                f"best_scale={stats['best_scale']}"
+            )
+        return stats
 
     def measure_text_shape_coverage(self, sample_size: int = 5000) -> dict[str, Any]:
         """Estimate how often TextShapeCarrier can safely write on this corpus.
@@ -746,6 +1224,40 @@ class GhostAuditInterceptor:
         """
         return self.intercept_result(row_id, fields).fields
 
+    def _current_embedding_probability(self) -> float:
+        """Calculate dynamic p based on rates and target spread.
+
+        Goal: finish the current event in self._target_spread_factor * event_interval.
+        """
+        if not self._payload_queue:
+            return 1.0
+
+        # target_spread_factor <= 0 disables the scheduler (for tests/debug)
+        if self._target_spread_factor <= 0:
+            return 1.0
+
+        # If we have no rate data yet, default to full speed (safe but detectable)
+        # to ensure the system works until EMA stabilizes.
+        if self._app_write_rate_ema == 0 or self._avg_event_interval_ema == 0:
+            return 1.0
+
+        payload = self._payload_queue[0]
+        # Use TOTAL bits (max_bits) instead of remaining bits to maintain
+        # a constant, predictable spread rate throughout the event duration.
+        # This prevents the "deceleration" effect as the queue empties.
+        total_steps = max(1, payload.max_bits)
+
+        # target_duration = spread_factor * inter_event_interval
+        target_duration = self._target_spread_factor * self._avg_event_interval_ema
+
+        # expected_app_writes = target_duration * writes_per_second
+        expected_app_writes = target_duration * self._app_write_rate_ema
+
+        # p = total_steps / expected_writes
+        p = float(total_steps) / max(1.0, expected_app_writes)
+
+        return max(0.01, min(1.0, p))
+
     def intercept_result(self, row_id: Any, fields: dict[str, Any]) -> InterceptResult:
         """Apply the next pending stego logical-bit-tuple to a field dict.
 
@@ -770,99 +1282,164 @@ class GhostAuditInterceptor:
         opportunistic row selection: if TextShape cannot safely write on this
         row, the pending payload position is not consumed.
         """
-        if not self._payload_queue:
-            return InterceptResult(dict(fields), False, "no_pending_payload", row_id)
+        with self._lock:
+            self._intercept_count += 1
+            # Update app write rate EMA (even if no pending payload, to keep rate current)
+            now = time.time()
+            if self._last_intercept_time > 0 and not self._restarted:
+                dt = now - self._last_intercept_time
+                if dt > 0:
+                    rate = 1.0 / dt
+                    if self._app_write_rate_ema == 0:
+                        self._app_write_rate_ema = rate
+                    else:
+                        self._app_write_rate_ema = (
+                            self._ema_alpha * rate + (1 - self._ema_alpha) * self._app_write_rate_ema
+                        )
+            self._last_intercept_time = now
+            self._restarted = False
+            
+            # Persist scheduler state periodically or when it changes significantly
+            if self._intercept_count % 100 == 0:
+                self._save_scheduler_state()
 
-        if self.config.table != "sys_cache":
-            self._ensure_carrier_rows()
-            row_idx = self._row_id_index.get(row_id)
-            if row_idx is None:
-                return InterceptResult(dict(fields), False, "unknown_row", row_id)
-            if (row_idx % self.config.slot_size) < self.config.header_row_count:
-                return InterceptResult(dict(fields), False, "header_row", row_id)
-
-        payload = self._payload_queue[0]
-
-        if payload.should_defer():
-            payload.note_row()
-            return InterceptResult(dict(fields), False, "temporal_delay", row_id)
-
-        logical_bits = payload.peek_logical_bits()
-
-        if logical_bits is None:
-            # This payload is done.  Defer the header write until the app has
-            # committed its carrier-row updates, avoiding SQLite write-lock
-            # conflicts with the caller's transaction.
-            completed = self._payload_queue.pop(0)
-            self._completed_payloads.append(completed)
             if not self._payload_queue:
-                return InterceptResult(dict(fields), False, "payload_completed", row_id)
+                return InterceptResult(dict(fields), False, "no_pending_payload", row_id)
+
+            if self.config.table != "sys_cache":
+                self._ensure_carrier_rows()
+                row_idx = self._row_id_index.get(row_id)
+                if row_idx is None:
+                    return InterceptResult(dict(fields), False, "unknown_row", row_id)
+                if (row_idx % self.config.slot_size) < self.config.header_row_count:
+                    return InterceptResult(dict(fields), False, "header_row", row_id)
+
             payload = self._payload_queue[0]
-            logical_bits = payload.peek_logical_bits()
-            if logical_bits is None:
-                return InterceptResult(dict(fields), False, "payload_completed", row_id)
 
-        result = dict(fields)
-        mapping = self._engine._get_row_carrier_mapping(row_id)
-        cfg = self.config
+            if payload.should_defer():
+                payload.note_row()
+                if payload.rows_seen % 50 == 0:
+                    self._save_payload(payload)
+                return InterceptResult(dict(fields), False, "temporal_delay", row_id)
 
-        sem = cfg.semantic_field
-        fa  = cfg.float_a_field
-        fb  = cfg.float_b_field
-        til = cfg.tilde_field
+            # Determine which channel this row belongs to (Round-Robin)
+            row_idx = self._row_id_index.get(row_id, 0)
+            target_channel = (row_idx % self.config.slot_size) % 5
 
-        for physical_carrier in range(5):
-            logical_ch = mapping[physical_carrier]
-            bit = logical_bits.get(logical_ch, 0)
+            # Check if this channel is already finished for this payload
+            # (Needed because channels might have slightly different bit counts due to RS)
+            max_bits_ch = len(payload.channel_bits.get(target_channel, [])) * payload.repetitions
+            if payload._pos[target_channel] >= max_bits_ch:
+                # This channel is done, but others might not be. 
+                # We skip this row to avoid corrupting it with old bits.
+                return InterceptResult(dict(fields), False, "channel_exhausted", row_id)
 
-            if physical_carrier == 0:
+            # Probability Gate (Rate-adaptive Scheduler)
+            prob = self._current_embedding_probability()
+            if random.random() > prob:
+                return InterceptResult(dict(fields), False, "scheduler_skip", row_id)
+
+            bit = payload.peek_bit(target_channel)
+
+            result = dict(fields)
+            mapping = self._engine._get_row_carrier_mapping(row_id)
+            cfg = self.config
+
+            # Find which physical carrier maps to this logical channel
+            # mapping[physical_idx] = logical_channel
+            physical_idx = -1
+            for p_idx, l_ch in enumerate(mapping):
+                if l_ch == target_channel:
+                    physical_idx = p_idx
+                    break
+            
+            if physical_idx == -1:
+                return InterceptResult(dict(fields), False, "channel_mapping_error", row_id)
+
+            sem = cfg.semantic_field
+            fa  = cfg.float_a_field
+            fb  = cfg.float_b_field
+            til = cfg.tilde_field
+
+            # Only modify the ONE physical carrier that maps to our target channel
+            if physical_idx == 0:
                 if sem in result and result[sem] is not None:
                     if self._calibrated:
                         result[sem] = self._calibrator.encode_bit(result[sem], bit)
                     else:
                         result[sem] = StegoEngine.encode_bit_semantic(result[sem], bit)
-            elif physical_carrier == 1:
+            elif physical_idx == 1:
                 if fa in result and result[fa] is not None:
+                    if self._float_warmup_samples > 0 and not self._float_calibrator.ready:
+                        return InterceptResult(dict(fields), False, "float_warmup", row_id)
                     result[fa] = StegoEngine.encode_bit_float_lsb(
-                        result[fa], bit, row_id=row_id
+                        result[fa], bit, row_id=row_id,
+                        scale=self._float_calibrator.best_scale
                     )
-            elif physical_carrier == 2:
+            elif physical_idx == 2:
                 if sem in result and result[sem] is not None:
                     encoded = TextShapeCarrier.encode_bit(result[sem], bit)
                     if not encoded.written:
-                        return InterceptResult(
-                            dict(fields), False,
-                            f"carrier_gating:{encoded.reason}", row_id
-                        )
+                        return InterceptResult(dict(fields), False, f"carrier_gating:{encoded.reason}", row_id)
                     result[sem] = encoded.text
                 else:
-                    return InterceptResult(
-                        dict(fields), False, "carrier_gating:missing_text", row_id
-                    )
-            elif physical_carrier == 3:
+                    return InterceptResult(dict(fields), False, "carrier_gating:missing_text", row_id)
+            elif physical_idx == 3:
                 if fb in result and result[fb] is not None:
+                    if self._float_warmup_samples > 0 and not self._float_calibrator.ready:
+                        return InterceptResult(dict(fields), False, "float_warmup", row_id)
                     result[fb] = StegoEngine.encode_bit_float_lsb(
-                        result[fb], bit, row_id=row_id
+                        result[fb], bit, row_id=row_id,
+                        scale=self._float_calibrator.best_scale
                     )
-            elif physical_carrier == 4:
+            elif physical_idx == 4:
                 if til in result and result[til] is not None:
                     result[til] = StegoEngine.encode_bit_avatar_url(
                         result[til], bit, row_id=row_id
                     )
 
-        payload.advance()
+            payload.advance(target_channel)
 
-        # If this was the last bit, queue the header for a later flush.
-        if payload.exhausted:
-            completed = self._payload_queue.pop(0)
-            self._completed_payloads.append(completed)
+            # Update manifest for the modified row.
+            # While the app hasn't written the row yet, we update our manifest
+            # with the MAC of the fields we are returning. If the app rollbacks,
+            # the manifest will correctly mark this row as corrupted/erasure.
+            new_mac = self._engine._sys_cache_row_mac(
+                row_id,
+                result.get(cfg.semantic_field, ""),
+                result.get(cfg.float_a_field, 0.0),
+                result.get(cfg.float_b_field, 0.0),
+                result.get(cfg.tilde_field, "")
+            )
+            self._engine._set_sys_cache_write_mode(True, commit=False)
+            try:
+                self._engine.conn.execute(
+                    f"INSERT OR REPLACE INTO {self._engine.AUX_MANIFEST_TABLE} (id, row_mac, updated_at) "
+                    f"VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (row_id, new_mac)
+                )
+            finally:
+                self._engine._set_sys_cache_write_mode(False, commit=True)
 
-        return InterceptResult(result, result != fields, "embedded", row_id)
+            # If this was the last bit, queue the header for a later flush.
+            if payload.exhausted:
+                completed = self._payload_queue.pop(0)
+                self._delete_payload(completed.seq)
+                self._completed_payloads.append(completed)
+                self._save_scheduler_state()
+            else:
+                # Persist progress after every bit-tuple embedding for maximum integrity.
+                # While this adds a small DB overhead, it ensures that audit events
+                # survive process crashes with zero bit loss.
+                self._save_payload(payload)
+
+            return InterceptResult(result, result != fields, "embedded", row_id)
 
     def flush_headers(self) -> None:
         """Write headers for payloads whose bits have fully been embedded."""
-        while self._completed_payloads:
-            self._flush_slot_header(self._completed_payloads.pop(0))
+        with self._lock:
+            while self._completed_payloads:
+                self._flush_slot_header(self._completed_payloads.pop(0))
 
     def _flush_slot_header(self, payload: "_PendingPayload") -> None:
         """Write the slot header for a completed payload to the carrier table.
@@ -937,11 +1514,15 @@ class GhostAuditInterceptor:
                        if self._calibrated
                        else StegoEngine.decode_bit_semantic(bio))
             elif physical_carrier == 1:
-                bit = StegoEngine.decode_bit_float_lsb(score)
+                bit = StegoEngine.decode_bit_float_lsb(
+                    score, scale=self._float_calibrator.best_scale
+                )
             elif physical_carrier == 2:
                 bit = TextShapeCarrier.decode_bit(bio)
             elif physical_carrier == 3:
-                bit = StegoEngine.decode_bit_float_lsb(profile_score)
+                bit = StegoEngine.decode_bit_float_lsb(
+                    profile_score, scale=self._float_calibrator.best_scale
+                )
             else:
                 bit = StegoEngine.decode_bit_avatar_url(avatar_url or "", row_id=row_id)
             logical_bits[logical_ch] = bit
@@ -954,10 +1535,7 @@ class GhostAuditInterceptor:
 
     def pending_bit_count(self) -> int:
         """Total stego bits across all pending payloads."""
-        return sum(
-            max(0, p.max_bits - p._pos)
-            for p in self._payload_queue
-        )
+        return sum(p.remaining_bits for p in self._payload_queue)
 
     # ------------------------------------------------------------------ log_event
 
@@ -983,15 +1561,48 @@ class GhostAuditInterceptor:
         self, event_msgs: list[str], immediate_commit: bool
     ) -> list[int]:
         """Internal: log via V7 engine AND enqueue ECC bits for intercept()."""
-        seqs = self._engine.log_events(event_msgs, immediate_commit=immediate_commit)
+        with self._lock:
+            # Capacity check (Reject-New strategy)
+            if len(self._payload_queue) + len(event_msgs) > self.max_queue_size:
+                err_msg = (f"Queue overflow: current={len(self._payload_queue)}, "
+                           f"new={len(event_msgs)}, max={self.max_queue_size}. "
+                           "Rejecting new events to prevent history flushing.")
+                if self.verbose:
+                    print(f"[V9] {err_msg}")
+                
+                # Emit a SIEM warning if possible (V7 engine handles the export)
+                # We log a synthetic event about the overflow to the visible log
+                # so the gap is documented.
+                self._engine.log_events(
+                    [f"SYSTEM_WARNING: GhostAudit Queue Overflow. {err_msg}"],
+                    immediate_commit=True
+                )
+                raise QueueOverflowError(err_msg)
 
-        for msg in event_msgs:
-            self._enqueue_event_bits(msg)
+            # Update event interval EMA
+            now = time.time()
+            if self._last_event_time > 0 and not self._restarted:
+                dt = now - self._last_event_time
+                if self._avg_event_interval_ema == 0:
+                    self._avg_event_interval_ema = dt
+                else:
+                    self._avg_event_interval_ema = (
+                        self._ema_alpha * dt + (1 - self._ema_alpha) * self._avg_event_interval_ema
+                    )
+            self._last_event_time = now
+            self._restarted = False
+            self._save_scheduler_state()
 
-        return seqs if seqs else []
+            seqs = self._engine.log_events(event_msgs, immediate_commit=immediate_commit)
+
+            for msg in event_msgs:
+                self._enqueue_event_bits(msg)
+
+            return seqs if seqs else []
 
     def _enqueue_event_bits(self, event_msg: str) -> None:
         """RS+RAID-6 encode one event message and push to _payload_queue."""
+        # Note: caller (_log_and_enqueue) holds self._lock
         e = self._engine
         msg_bytes = event_msg.encode("utf-8")
         compressed_bytes = __import__("zlib").compress(msg_bytes, level=9)
@@ -1002,12 +1613,23 @@ class GhostAuditInterceptor:
         payload_bytes = mac + stored
 
         payload_rows = self.config.slot_size - self.config.header_row_count
+
+        # For external carriers, we must account for coverage (not all rows are
+        # eligible). We use a conservative fixed estimate for capacity
+        # planning to ensure recovery remains deterministic without storing
+        # the measurement in the header.
+        coverage = 1.0
+        if self.config.table != "sys_cache":
+            coverage = self.EXTERNAL_COVERAGE_ESTIMATE
+        
+        effective_payload_rows = int(payload_rows * coverage)
+        
         nsym = e._select_ecc_symbols(
-            len(stored), payload_rows, per_channel=True
+            len(stored), effective_payload_rows, per_channel=True
         )
         channel_blocks = e._encode_payload_per_channel_v7(payload_bytes, nsym)
         source_bit_count = max(len(block) for block in channel_blocks.values()) * 8
-        repetitions = e._get_dynamic_repetitions(source_bit_count, payload_rows)
+        repetitions = e._get_dynamic_repetitions(source_bit_count, effective_payload_rows)
 
         # Determine sequence number from last logged event
         cursor = e.conn.cursor()
@@ -1028,17 +1650,17 @@ class GhostAuditInterceptor:
             else 0,
         )
 
-        self._payload_queue.append(
-            _PendingPayload(
-                channel_blocks=channel_blocks,
-                seq=seq,
-                nsym=nsym,
-                stored_msg_len=len(stored),
-                compressed=store_compressed,
-                repetitions=repetitions,
-                start_after_rows=start_after_rows,
-            )
+        payload = _PendingPayload(
+            channel_blocks=channel_blocks,
+            seq=seq,
+            nsym=nsym,
+            stored_msg_len=len(stored),
+            compressed=store_compressed,
+            repetitions=repetitions,
+            start_after_rows=start_after_rows,
         )
+        self._payload_queue.append(payload)
+        self._save_payload(payload)
 
     # ------------------------------------------------------------------ recovery
 
@@ -1101,10 +1723,9 @@ class GhostAuditInterceptor:
                 row = hdr_rows.get(rid)
                 if row:
                     _, bio, fa, fb, til = row
-                    h_bits.append(
-                        e._decode_header_bit(rid, bio, fa,
+                    bit = e._decode_header_bit(rid, bio, fa,
                                              profile_score=fb, avatar_url=til)
-                    )
+                    h_bits.append(bit)
                 else:
                     h_bits.append(0)
 
@@ -1141,6 +1762,11 @@ class GhostAuditInterceptor:
             if max_bits == 0:
                 continue
 
+            # IMPORTANT: temporal delay skips rows from the TOTAL payload row list,
+            # not just the eligible ones.
+            if start_after_rows > 0:
+                payload_ids = payload_ids[start_after_rows:]
+
             placeholders = ",".join("?" * len(payload_ids))
             cursor.execute(
                 f"SELECT {cfg.id_field}, {cfg.semantic_field}, "
@@ -1150,80 +1776,130 @@ class GhostAuditInterceptor:
                 payload_ids,
             )
             payload_rows = {r[0]: r for r in cursor.fetchall()}
-            eligible_payload_ids: list[Any] = []
+            
+            # Repetition count must be calculated based on the total
+            # slot capacity scaled by our conservative coverage estimate.
+            total_payload_rows = cfg.slot_size - cfg.header_row_count
+            effective_payload_rows = int(total_payload_rows * self.EXTERNAL_COVERAGE_ESTIMATE)
+            repetitions = e._get_dynamic_repetitions(max_bits, effective_payload_rows)
+
+            channel_votes: dict[int, list[list[int]]] = {c: [[] for _ in range(max_bits)] for c in range(5)}
+
+            # Iterate through all payload rows and collect bits for their assigned channels
             for rid in payload_ids:
                 row = payload_rows.get(rid)
                 if not row:
                     continue
-                _, bio, _fa, _fb, _til = row
-                if TextShapeCarrier.decode_bit(bio) is not None:
-                    eligible_payload_ids.append(rid)
+                _, bio, fa, fb, til = row
+                
+                # Verify Row-MAC before extracting bits (Vector A resilience)
+                # If tampering is detected, we skip the row, which turns the error
+                # into an erasure for the RS decoder.
+                if not e._verify_sys_cache_row(rid, bio, fa, profile_score=fb, avatar_url=til):
+                    if self.verbose:
+                        print(f"[V9 DEBUG] Row MAC failed for rid={rid} - turning into erasure")
+                    continue
 
-            if start_after_rows > 0:
-                eligible_payload_ids = eligible_payload_ids[start_after_rows:]
+                row_idx = self._row_id_index.get(rid, 0)
+                target_channel = (row_idx % cfg.slot_size) % 5
+                
+                # Check eligibility for this channel
+                mapping = e._get_row_carrier_mapping(rid)
+                physical_idx = -1
+                for p_idx, l_ch in enumerate(mapping):
+                    if l_ch == target_channel:
+                        physical_idx = p_idx
+                        break
+                
+                if physical_idx == -1: continue
 
-            repetitions = e._get_dynamic_repetitions(max_bits, len(eligible_payload_ids))
+                bit = None
+                if physical_idx == 0: # semantic
+                    bit = (self._calibrator.decode_bit(bio) if self._calibrated 
+                           else StegoEngine.decode_bit_semantic(bio))
+                elif physical_idx == 1: # float_a
+                    bit = StegoEngine.decode_bit_float_lsb(fa, scale=self._float_calibrator.best_scale)
+                elif physical_idx == 2: # text_shape
+                    bit = TextShapeCarrier.decode_bit(bio)
+                elif physical_idx == 3: # float_b
+                    bit = StegoEngine.decode_bit_float_lsb(fb, scale=self._float_calibrator.best_scale)
+                elif physical_idx == 4: # avatar
+                    bit = StegoEngine.decode_bit_avatar_url(til or "", row_id=rid)
+                
+                if bit is not None:
+                    # We found a bit. Which bit_idx does it belong to?
+                    # We need to track how many eligible rows we've seen for this channel.
+                    # Wait, we need a counter per channel.
+                    if not hasattr(self, "_tmp_ch_counters"):
+                        self._tmp_ch_counters = {c: 0 for c in range(5)}
+                    
+                    curr_pos = self._tmp_ch_counters[target_channel]
+                    bit_idx = curr_pos // repetitions
+                    if bit_idx < max_bits:
+                        channel_votes[target_channel][bit_idx].append(bit)
+                    self._tmp_ch_counters[target_channel] += 1
+
+            if hasattr(self, "_tmp_ch_counters"):
+                del self._tmp_ch_counters
 
             channel_bits: dict[int, list[int]] = {c: [] for c in range(5)}
+            erasures: dict[int, list[int]] = {c: [] for c in range(5)}
 
-            for bit_idx in range(max_bits):
-                votes: dict[int, list[int]] = {c: [] for c in range(5)}
-                for rep in range(repetitions):
-                    row_pos = bit_idx * repetitions + rep
-                    if row_pos >= len(eligible_payload_ids):
-                        break
-                    rid = eligible_payload_ids[row_pos]
-                    row = payload_rows.get(rid)
-                    if not row:
-                        continue
-                    _, bio, fa, fb, til = row
-                    logical = self._decode_all_columns_v9(rid, bio, fa, fb, til)
-                    for c in range(5):
-                        v = logical.get(c)
-                        if v is not None:
-                            votes[c].append(v)
-
-                for c in range(5):
-                    vs = votes[c]
+            for c in range(5):
+                for bit_idx in range(max_bits):
+                    vs = channel_votes[c][bit_idx]
                     if vs:
                         channel_bits[c].append(1 if sum(vs) > len(vs) // 2 else 0)
                     else:
                         channel_bits[c].append(0)
+                        if bit_idx < enc_bit_counts[c]:
+                            byte_pos = bit_idx // 8
+                            if byte_pos not in erasures[c]:
+                                erasures[c].append(byte_pos)
 
             # ---- RS + RAID-6 decode ----
             channel_bytes: dict[int, bytes] = {}
             for c in range(5):
                 bits = channel_bits[c]
-                expected = enc_bit_counts[c] // 8  # enc_bit_counts is a list
+                # Match byte boundary (round up)
+                expected_bytes = (enc_bit_counts[c] + 7) // 8
                 raw = e._bits_to_bytes(bits[:enc_bit_counts[c]])
-                raw = raw[:expected] if len(raw) >= expected else raw
+                raw = raw[:expected_bytes] if len(raw) >= expected_bytes else raw
                 channel_bytes[c] = raw
 
-            # Try per-channel RS decode
+            # Try per-channel RS decode for ALL 5 channels to identify which are "clean"
             from reedsolo import RSCodec, ReedSolomonError
             channel_plain: dict[int, bytes] = {}
-            erasures: dict[int, list[int]] = {c: [] for c in range(5)}
-            for c in range(3):  # data channels
+            failed_channels = []
+            
+            for c in range(5):
                 raw = channel_bytes.get(c, b"")
                 if not raw:
+                    failed_channels.append(c)
                     continue
                 try:
                     dec = RSCodec(nsym).decode(raw, erase_pos=erasures.get(c, []))
                     channel_plain[c] = dec[0] if isinstance(dec, tuple) else dec
                 except ReedSolomonError:
-                    pass  # RAID-6 will attempt recovery
+                    failed_channels.append(c)
 
-            # RAID-6 recovery if any data channel missing
-            if len(channel_plain) < 3:
+            # RAID-6 recovery if any DATA channel (0,1,2) is missing from channel_plain
+            if any(c not in channel_plain for c in range(3)):
+                # We must provide RAW RS-encoded blocks to _recover_from_pq_parity,
+                # but ONLY for the channels that are "working". Missing channels
+                # must be absent from the dict so they get reconstructed.
+                working_raw = {c: v for c, v in channel_bytes.items() if c not in failed_channels}
+                
+                # V7's _recover_from_pq_parity reconstructs missing blocks and decodes them.
                 recovered_ch = e._recover_from_pq_parity(
-                    channel_bytes, nsym, erasures
+                    working_raw, nsym, erasures
                 )
                 if recovered_ch:
-                    channel_plain = {
-                        c: v for c, v in recovered_ch.items() if c < 3
-                    }
+                    for c in range(3):
+                        if c in recovered_ch:
+                            channel_plain[c] = recovered_ch[c]
 
-            if len(channel_plain) < 3:
+            if any(c not in channel_plain for c in range(3)):
                 continue
 
             # Reassemble payload bytes from 3 data channels
@@ -1244,7 +1920,15 @@ class GhostAuditInterceptor:
                         if i < len(ch_bits_dec[c]):
                             interleaved.append(ch_bits_dec[c][i])
 
+                # IMPORTANT: truncate to actual payload size (MAC + stored_msg_len)
+                # payload_len from header is the length of the stored_msg.
+                total_payload_bits = (16 + payload_len) * 8
+                interleaved = interleaved[:total_payload_bits]
+
                 payload_bytes = e._bits_to_bytes(interleaved)
+                
+                # Further ensure byte-level truncation matches header
+                payload_bytes = payload_bytes[:16 + payload_len]
             except Exception:
                 continue
 

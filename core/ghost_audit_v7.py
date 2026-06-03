@@ -100,8 +100,7 @@ class StegoEngine:
         return 0
 
     @staticmethod
-    def encode_bit_float_lsb(value, bit, row_id=None):
-        scale = 1000000
+    def encode_bit_float_lsb(value, bit, row_id=None, scale=1000000):
         scaled = int(round(value * scale))
         if (scaled % 2) != bit:
             # Always use row_id or a hash of the value to decide direction
@@ -115,12 +114,11 @@ class StegoEngine:
         return float(scaled) / scale
 
     @staticmethod
-    def decode_bit_float_lsb(value):
+    def decode_bit_float_lsb(value, scale=1000000):
         if value is None:
             return None
         if abs(value) < 1e-12:
             return None
-        scale = 1000000
         scaled = int(round(value * scale))
         return scaled % 2
 
