@@ -505,19 +505,44 @@ ga = GhostAuditInterceptor(
 ```python
 ga.log_event("user=alice action=login")
 
+# fields sind die Werte, die du in die DB schreiben willst.
+# Der Caller muss sicherstellen, dass alle relevanten Felder vollständig
+# übergeben werden — auch wenn die App nur ein Subset updatet.
 fields = {
-    "bio": current_bio,
-    "trust_score": current_trust_score,
-    "profile_score": current_profile_score,
-    "avatar_url": current_avatar_url,
+    "bio": new_bio,              # der Wert, den das UPDATE gleich setzen wird
+    "trust_score": new_score,
+    "profile_score": new_profile,
+    "avatar_url": new_avatar,
 }
 fields = ga.intercept(row_id=user_id, fields=fields)
+# ↑ intercept() darf die Werte minimal transformieren (TextShape, Synonym,
+#   Float-LSB). Der Rückgabewert ist das, was tatsächlich geschrieben wird.
 
-# Die App schreibt genau diese Werte mit ihrem normalen UPDATE.
+# Die App schreibt genau diesen Rückgabewert mit ihrem normalen UPDATE.
 # Nach dem Commit kann optional explizit geflusht werden; recover_events()
 # ruft flush_headers() ebenfalls automatisch auf.
 ga.flush_headers()
 ```
+
+**`intercept()` — Caller Contract (in einem Satz):**
+
+> `fields` sind die Werte, die du schreiben willst; `intercept()` gibt dir
+> zurück, was du tatsächlich schreiben sollst.
+
+**Daraus folgt:**
+
+- Der Caller baut `fields` aus *seinen* neuen Werten auf (oder liest erst
+  die DB, wenn das Update nur ein Subset betrifft — das ist Sache der App,
+  nicht von GhostAudit).
+- `intercept()` kennt **keinen** Vorher-Wert. Es arbeitet ausschließlich auf
+  dem übergebenen Dict. Wenn `bio` keine TextShape-Carrier-Form trägt, wird
+  die Row übersprungen und das pending Bit auf eine andere elegible Row
+  verteilt.
+- Der Rückgabewert ist **immer** ein vollständiges Dict mit denselben Keys
+  wie `fields`. Auch wenn kein Bit eingebettet wurde, ist `returned == input`
+  mit identischen Werten — die App kann bedingungslos schreiben.
+- Es gibt **keinen** `current_fields`-Parameter. Wer Carrier-Kontext aus
+  dem Vorher-Zustand braucht, muss den DB-Read vor `intercept()` machen.
 
 ### Logging
 
