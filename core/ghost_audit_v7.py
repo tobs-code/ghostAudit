@@ -1842,20 +1842,33 @@ class GhostAuditV7:
 
     def _create_key_state_table(self):
         cursor = self.conn.cursor()
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self._key_state_table} (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                evolve_count INTEGER NOT NULL DEFAULT 0
+        pc = getattr(self, '_process_count', 1)
+        if pc > 1:
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._key_state_table} (
+                    id INTEGER PRIMARY KEY,
+                    evolve_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
             )
-            """
-        )
-        cursor.execute(
-            f"""
-            INSERT OR IGNORE INTO {self._key_state_table} (id, evolve_count)
-            VALUES (1, 0)
-            """
-        )
+            for pid in range(pc):
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO {self._key_state_table} (id, evolve_count) VALUES (?, 0)",
+                    (pid + 1,),
+                )
+        else:
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._key_state_table} (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    evolve_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            cursor.execute(
+                f"INSERT OR IGNORE INTO {self._key_state_table} (id, evolve_count) VALUES (1, 0)"
+            )
         self.conn.commit()
 
     def _create_metronome_table(self):
@@ -1896,7 +1909,8 @@ class GhostAuditV7:
 
     def _load_key_evolve_state(self):
         cursor = self.conn.cursor()
-        cursor.execute(f"SELECT evolve_count FROM {self._key_state_table} WHERE id=1")
+        kid = getattr(self, '_process_id', 0) + 1
+        cursor.execute(f"SELECT evolve_count FROM {self._key_state_table} WHERE id=?", (kid,))
         row = cursor.fetchone()
         if row and row[0] > 0:
             self._key_evolve_count = row[0]
@@ -2687,7 +2701,13 @@ class GhostAuditV7:
         """Batch-log multiple events with a single header scan + commit."""
         cursor = self.conn.cursor()
         slot_sequences = self._scan_slots(cursor)
-        base_seq = max(seq for _, seq in slot_sequences) + 1 if any(seq > 0 for _, seq in slot_sequences) else 1
+        if getattr(self, '_process_count', 1) > 1:
+            n = len(event_msgs)
+            cursor.execute("UPDATE sys_sequence_counter SET next_seq = next_seq + ? WHERE id = 1", (n,))
+            cursor.execute("SELECT next_seq - ? FROM sys_sequence_counter WHERE id = 1", (n,))
+            base_seq = cursor.fetchone()[0]
+        else:
+            base_seq = max(seq for _, seq in slot_sequences) + 1 if any(seq > 0 for _, seq in slot_sequences) else 1
 
         cursor.execute(
             f"SELECT sequence_number, entry_hash FROM {self.VISIBLE_LOG_TABLE} ORDER BY sequence_number DESC LIMIT 1"
@@ -2760,8 +2780,8 @@ class GhostAuditV7:
                 self._k_write_merkle = hmac.new(self._k_write_merkle, b"evolve", hashlib.sha256).digest()
 
             cursor.execute(
-                f"INSERT OR REPLACE INTO {self._key_state_table} (id, evolve_count) VALUES (1, ?)",
-                (self._key_evolve_count,),
+                f"INSERT OR REPLACE INTO {self._key_state_table} (id, evolve_count) VALUES (?, ?)",
+                (getattr(self, '_process_id', 0) + 1, self._key_evolve_count,),
             )
             if immediate_commit:
                 # Two-phase external state (begin: before commit, finalize: after)

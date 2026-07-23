@@ -107,6 +107,8 @@ class _V9Engine(GhostAuditV7):
         # instance *after* super().__init__ to override the defaults.
         self._init_slot_size = kwargs.pop("slot_size", None)
         self._init_slot_count = kwargs.pop("slot_count", None)
+        self._process_id = kwargs.pop("_process_id", 0)
+        self._process_count = kwargs.pop("_process_count", 1)
 
         # Patch AUX_TABLE on the *instance* before super().__init__ calls
         # _setup_db, so every table reference inside _setup_db is correct.
@@ -124,6 +126,20 @@ class _V9Engine(GhostAuditV7):
             self.SLOT_SIZE = self._init_slot_size
         if self._init_slot_count is not None:
             self.SLOT_COUNT = self._init_slot_count
+
+        # Create the atomic sequence counter for multi-process mode
+        if self._process_count > 1:
+            try:
+                self.conn.execute(
+                    "CREATE TABLE IF NOT EXISTS sys_sequence_counter "
+                    "(id INTEGER PRIMARY KEY, next_seq INTEGER NOT NULL)"
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO sys_sequence_counter (id, next_seq) VALUES (1, 1)"
+                )
+                self.conn.commit()
+            except Exception:
+                pass
 
     def _decode_channel_bit(self, channel: int, bio: str, score: float,
                             profile_score: float = 0.0, avatar_url: str = "",
@@ -948,9 +964,13 @@ class GhostAuditInterceptor:
         external_state_path: str | None = None,
         force_reinit: bool = False,
         max_queue_size: int = 100,
+        process_id: int = 0,
+        process_count: int = 1,
     ):
         self.config = carrier_config or v7_default_config()
         self.verbose = verbose
+        self._process_id = max(0, process_id)
+        self._process_count = max(1, process_count)
         self._target_spread_factor = target_spread_factor
         self.max_queue_size = max(1, max_queue_size)
         
@@ -982,6 +1002,8 @@ class GhostAuditInterceptor:
             force_reinit=force_reinit,
             slot_size=self.config.slot_size,
             slot_count=self.config.slot_count,
+            _process_id=self._process_id,
+            _process_count=self._process_count,
         )
 
         # Ensure the engine uses the same slot configuration as the interceptor
@@ -1199,7 +1221,19 @@ class GhostAuditInterceptor:
                 f"SELECT {cfg.id_field} FROM {cfg.table} ORDER BY {cfg.id_field}"
             )
             rows = cursor.fetchall()
-            self._row_id_list = [r[0] for r in rows]
+            all_ids = [r[0] for r in rows]
+            if self._process_count > 1:
+                self._row_id_list = [
+                    rid for rid in all_ids
+                    if int(rid) % self._process_count == self._process_id
+                ]
+                if self.verbose:
+                    print(
+                        f"[V9] Process {self._process_id}/{self._process_count}: "
+                        f"{len(self._row_id_list)}/{len(all_ids)} carrier rows assigned"
+                    )
+            else:
+                self._row_id_list = all_ids
             self._row_id_index = {rid: idx for idx, rid in enumerate(self._row_id_list)}
 
             # Also update the V7 engine's _orig_ids so its ECC/header paths work
