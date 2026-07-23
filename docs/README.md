@@ -729,21 +729,21 @@ python tests/benchmark_throughput_v8.py
 
 | Angriff | Vektor | Ergebnis |
 |---------|--------|----------|
-| MAC-Strip | `row_mac` aus Manifest gelöscht | ✅ 3/3 RECOVERED |
-| MUX Row-Wipe 15% | 15% der Payload-Zeilen gelöscht | ✅ 3/3 RECOVERED |
-| Bio-Normalize | `bio` lowercase+trim+synonym (2/5 Carrier) | ✅ 3/3 RECOVERED |
-| Both-Floats Round | `trust_score`+`profile_score` gerundet (2/5 Carrier) | ✅ 3/3 RECOVERED |
-| Gaussian Seed | Seed-Recovery-Versuch (Positive Control) | ✅ 3/3 RECOVERED |
+| MAC-Strip | `row_mac` aus Manifest gelöscht | 3/3 RECOVERED |
+| MUX Row-Wipe 15% | 15% der Payload-Zeilen gelöscht | 3/3 RECOVERED |
+| Bio-Normalize | `bio` lowercase+trim+synonym (2/5 Carrier) | 3/3 RECOVERED |
+| Both-Floats Round | `trust_score`+`profile_score` gerundet (2/5 Carrier) | 3/3 RECOVERED |
+| Gaussian Seed | Seed-Recovery-Versuch (Positive Control) | 3/3 RECOVERED |
 
 ### Resilienz-Benchmark V7
 
 | Test | Schwelle | Ergebnis |
 |------|----------|----------|
-| Erasure Tolerance | ≥90% bei 8% Row-Erasure | ✅ 100% |
-| Bit-Flip Resistance | ≥80% bei 10% BER | ✅ 100% |
-| Channel Isolation | ≥90% bei partieller Ch0-Korruption | ✅ 100% |
-| Multi-Column Erasure | ≥70% bei 50% Trailing-Space-Wipe | ✅ 100% |
-| High BER Tolerance | ≥70% bei 10% Float-BER | ✅ 100% |
+| Erasure Tolerance | ≥90% bei 8% Row-Erasure | 100% |
+| Bit-Flip Resistance | ≥80% bei 10% BER | 100% |
+| Channel Isolation | ≥90% bei partieller Ch0-Korruption | 100% |
+| Multi-Column Erasure | ≥70% bei 50% Trailing-Space-Wipe | 100% |
+| High BER Tolerance | ≥70% bei 10% Float-BER | 100% |
 
 **5/5 — 100% PASSED**
 

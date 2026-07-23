@@ -96,6 +96,7 @@ class _V9Engine(GhostAuditV7):
     # Set by GhostAuditInterceptor before instantiation
     _external_carrier: bool = False
     _carrier_config: "CarrierConfig | None" = None
+    _use_integer_ch0: bool = False
 
     def __init__(self, *args, **kwargs):
         # Extract params needed before super().__init__
@@ -143,9 +144,12 @@ class _V9Engine(GhostAuditV7):
 
     def _decode_channel_bit(self, channel: int, bio: str, score: float,
                             profile_score: float = 0.0, avatar_url: str = "",
-                            timestamp_value: int = 0):
+                            timestamp_value: int = 0,
+                            integer_channel_value: int = 0):
         """Decode a bit from physical carrier (0-4), matching V9 carriers."""
-        if channel == 0:      # Data: Semantic (bio synonym switching)
+        if channel == 0:
+            if self._use_integer_ch0:
+                return integer_channel_value & 1
             if self.semantic_calibrator and self.semantic_calibrator._fitted:
                 bit = self.semantic_calibrator.decode_bit(bio)
                 return bit if bit is not None else 0
@@ -165,28 +169,41 @@ class _V9Engine(GhostAuditV7):
 
     def _encode_channel_bit(self, channel: int, bio: str, score: float, bit: int,
                             row_id=None, profile_score: float = 0.0,
-                            avatar_url: str = ""):
+                            avatar_url: str = "",
+                            integer_channel_value: int = 0):
         """Encode a bit to physical carrier (0-4), matching V9 carriers.
 
         NOTE: Channel 2 (timestamp LSB) is handled by the Interceptor's
         intercept_result() path. This engine-level override keeps TextShape
         fallback for V7 compatibility paths.
+
+        Returns (bio, score, profile_score, avatar_url, integer_channel_value).
         """
-        if channel == 0:      # Data: Semantic (bio)
-            return StegoEngine.encode_bit_semantic(bio, bit), score, profile_score, avatar_url
+        if channel == 0:
+            if self._use_integer_ch0:
+                return (bio, score, profile_score, avatar_url,
+                        (integer_channel_value & ~1) | (bit & 1))
+            return (StegoEngine.encode_bit_semantic(bio, bit),
+                    score, profile_score, avatar_url, integer_channel_value)
         elif channel == 1:    # Data: Float-LSB (trust_score)
-            return bio, StegoEngine.encode_bit_float_lsb(score, bit, row_id=row_id, scale=self.float_scale), profile_score, avatar_url
+            return (bio, StegoEngine.encode_bit_float_lsb(score, bit, row_id=row_id, scale=self.float_scale),
+                    profile_score, avatar_url, integer_channel_value)
         elif channel == 2:    # Data: TextShape fallback (V7 compat)
             res = TextShapeCarrier.encode_bit(bio, bit)
-            return res.text, score, profile_score, avatar_url
+            return res.text, score, profile_score, avatar_url, integer_channel_value
         elif channel == 3:    # P Parity: Float-LSB (profile_score)
-            return bio, score, StegoEngine.encode_bit_float_lsb(profile_score, bit, row_id=row_id, scale=self.float_scale), avatar_url
+            return (bio, score,
+                    StegoEngine.encode_bit_float_lsb(profile_score, bit, row_id=row_id, scale=self.float_scale),
+                    avatar_url, integer_channel_value)
         elif channel == 4:    # Q Parity: Avatar Tilde (~) (avatar_url)
-            return bio, score, profile_score, StegoEngine.encode_bit_avatar_url(avatar_url, bit, row_id=row_id)
+            return (bio, score, profile_score,
+                    StegoEngine.encode_bit_avatar_url(avatar_url, bit, row_id=row_id),
+                    integer_channel_value)
         raise ValueError(f"Unknown channel: {channel}")
 
     def _sys_cache_row_mac(self, row_id, bio, score, profile_score=0.0, avatar_url="",
-                           timestamp_value: int | None = None):
+                           timestamp_value: int | None = None,
+                           integer_channel_value: int | None = None):
         """V9: Calculate 5 separate 8-Byte MACs over raw carrier field values.
         
         When ``timestamp_value`` is ``None`` (default), the timestamp is excluded
@@ -212,6 +229,8 @@ class _V9Engine(GhostAuditV7):
         data_to_mac_base += avatar_url.encode('utf-8') if avatar_url is not None else b''
         if timestamp_value is not None:
             data_to_mac_base += struct.pack(">q", int(timestamp_value))
+        if integer_channel_value is not None:
+            data_to_mac_base += struct.pack(">q", int(integer_channel_value))
         
         blob = b""
         for c in range(5): # Iterate for each of the 5 logical channels
@@ -226,6 +245,18 @@ class _V9Engine(GhostAuditV7):
             
         return blob
 
+    def _resolve_integer_ch0(self) -> None:
+        cfg = self._carrier_config
+        if not cfg or not cfg.integer_channel_field:
+            self._use_integer_ch0 = False
+            return
+        try:
+            cursor = self.conn.execute(f"PRAGMA table_info({cfg.table})")
+            columns = {row[1] for row in cursor.fetchall()}
+            self._use_integer_ch0 = cfg.integer_channel_field in columns
+        except Exception:
+            self._use_integer_ch0 = False
+
     def _rebuild_sys_cache_manifest(self):
         """Override V7 manifest rebuild to use V9 CarrierConfig fields."""
         if not self._external_carrier or not self._carrier_config:
@@ -239,13 +270,16 @@ class _V9Engine(GhostAuditV7):
         try:
             cursor.execute(f"DELETE FROM {self.AUX_MANIFEST_TABLE}")
             
-            # Build SELECT fields: all known carriers + optional timestamp_field
+            # Build SELECT fields: all known carriers + optional fields
             select_fields = [
                 cfg.id_field, cfg.semantic_field,
                 cfg.float_a_field, cfg.float_b_field, cfg.tilde_field,
             ]
             if cfg.timestamp_field and cfg.timestamp_field not in select_fields:
                 select_fields.append(cfg.timestamp_field)
+            has_int = bool(cfg.integer_channel_field)
+            if has_int and self._use_integer_ch0 and cfg.integer_channel_field not in select_fields:
+                select_fields.append(cfg.integer_channel_field)
             
             cursor.execute(
                 f"SELECT {', '.join(select_fields)} "
@@ -256,14 +290,18 @@ class _V9Engine(GhostAuditV7):
             has_ts = bool(cfg.timestamp_field)
             for row in cursor.fetchall():
                 row_id, bio, fa, fb, til = row[:5]
-                ts_raw = row[5] if has_ts and len(row) > 5 else None
+                col_idx = 5
+                ts_raw = row[col_idx] if has_ts and len(row) > col_idx else None
+                col_idx += 1 if has_ts else 0
                 ts_val = (GhostAuditInterceptor._parse_timestamp_to_int(ts_raw)
                           if ts_raw is not None else None)
+                int_raw = row[col_idx] if has_int and self._use_integer_ch0 and len(row) > col_idx else None
+                int_val = int(int_raw) if int_raw is not None else None
                 if bio is None or fa is None:
                     continue
                 
                 manifest_rows.append(
-                    (row_id, self._sys_cache_row_mac(row_id, bio, fa, fb, til, ts_val))
+                    (row_id, self._sys_cache_row_mac(row_id, bio, fa, fb, til, ts_val, int_val))
                 )
                 
             if manifest_rows:
@@ -276,7 +314,8 @@ class _V9Engine(GhostAuditV7):
             self._set_sys_cache_write_mode(False, commit=True)
 
     def _verify_sys_cache_row(self, row_id, bio, score, profile_score=0.0, avatar_url="",
-                              timestamp_value: int | None = None):
+                              timestamp_value: int | None = None,
+                              integer_channel_value: int | None = None):
          """Verify the integrity of a sys_cache row using its manifest HMAC."""
          cursor = self.conn.cursor()
          cursor.execute(
@@ -289,10 +328,242 @@ class _V9Engine(GhostAuditV7):
          
          stored_mac = res[0]
          current_mac = self._sys_cache_row_mac(
-             row_id, bio, score, profile_score, avatar_url, timestamp_value
+             row_id, bio, score, profile_score, avatar_url, timestamp_value,
+             integer_channel_value
          )
          
          return hmac.compare_digest(stored_mac, current_mac)
+
+
+    def _decode_all_columns_shuffled(self, row_id: int, bio: str, score: float,
+                                     profile_score: float = 0.0,
+                                     avatar_url: str = "",
+                                     integer_channel_value: int = 0) -> dict:
+        mapping = self._get_row_carrier_mapping(row_id)
+        logical_bits = {}
+        for physical_carrier in range(5):
+            logical_ch = mapping[physical_carrier]
+            bit = self._decode_channel_bit(
+                physical_carrier, bio, score, profile_score, avatar_url,
+                integer_channel_value=integer_channel_value
+            )
+            logical_bits[logical_ch] = bit if bit is not None else 0
+        return logical_bits
+
+    def _encode_all_columns_shuffled(self, row_id: int, bio: str, score: float,
+                                     profile_score: float, logical_bits: dict,
+                                     avatar_url: str = "",
+                                     integer_channel_value: int = 0) -> tuple:
+        mapping = self._get_row_carrier_mapping(row_id)
+        b, s, p, a, iv = bio, score, profile_score, avatar_url, integer_channel_value
+        for physical_carrier in range(5):
+            logical_ch = mapping[physical_carrier]
+            bit = logical_bits.get(logical_ch, 0)
+            if physical_carrier == 0:
+                old_bio = b
+            b, s, p, a, iv = self._encode_channel_bit(
+                physical_carrier, b, s, bit, row_id=row_id,
+                profile_score=p, avatar_url=a,
+                integer_channel_value=iv,
+            )
+            if physical_carrier == 0 and b == old_bio:
+                self._semantic_miss_count += 1
+        return b, s, p, a, iv
+
+    def _extract_all_channels_v8(self, cursor, slot_payload_ids, num_bits):
+        """Override: include integer_channel_field in SELECT when active."""
+        icf = (self._carrier_config.integer_channel_field
+               if self._use_integer_ch0 and self._carrier_config else "")
+        available_rows = len(slot_payload_ids)
+        if num_bits <= 0 or available_rows <= 0:
+            return {c: b"" for c in range(5)}, {c: [] for c in range(5)}
+
+        repetitions = self._get_dynamic_repetitions(num_bits, available_rows)
+        if num_bits * repetitions > available_rows:
+            repetitions = max(1, available_rows // num_bits)
+            if num_bits * repetitions > available_rows:
+                num_bits = available_rows
+                repetitions = 1
+
+        select_cols = "id, bio, trust_score, profile_score, avatar_url"
+        if icf:
+            select_cols += f", {icf}"
+
+        placeholders = ','.join(['?'] * len(slot_payload_ids))
+        cursor.execute(
+            f"SELECT {select_cols} FROM {self.AUX_TABLE} WHERE id IN ({placeholders}) ORDER BY id",
+            slot_payload_ids
+        )
+        rows = cursor.fetchall()
+        row_map = {}
+        for r in rows:
+            rid, bio, score, ps, av = r[0], r[1], r[2], r[3], (r[4] or "")
+            iv = int(r[5]) if icf and len(r) > 5 and r[5] is not None else 0
+            row_map[rid] = (bio, score, ps, av, iv)
+
+        cursor.execute(
+            f"SELECT id, row_mac FROM {self.AUX_MANIFEST_TABLE} WHERE id IN ({placeholders}) ORDER BY id",
+            slot_payload_ids
+        )
+        manifest_rows = cursor.fetchall()
+        manifest_map = {r[0]: r[1] for r in manifest_rows}
+
+        slot_idx = self._get_slot_idx_for_row(slot_payload_ids[0]) if slot_payload_ids else 0
+        _, k_hm = self._get_slot_keys(slot_idx)
+
+        channel_bits = {c: [] for c in range(5)}
+        channel_erasures = {c: [] for c in range(5)}
+
+        for bit_idx in range(num_bits):
+            votes = {c: [] for c in range(5)}
+            for rep in range(repetitions):
+                row_idx = bit_idx * repetitions + rep
+                if row_idx >= len(slot_payload_ids):
+                    break
+                rid = slot_payload_ids[row_idx]
+                row_data = row_map.get(rid)
+                if not row_data:
+                    continue
+                bio, score, ps, av, iv = row_data
+
+                logical_bits = self._decode_all_columns_shuffled(
+                    rid, bio, score, ps, avatar_url=av,
+                    integer_channel_value=iv
+                )
+
+                stored_mac = manifest_map.get(rid)
+                if stored_mac is not None:
+                    current_mac = self._sys_cache_row_mac(
+                        rid, bio, score, ps, av,
+                        integer_channel_value=iv,
+                    )
+                    mac_ok = hmac.compare_digest(stored_mac, current_mac)
+                else:
+                    mac_ok = False
+
+                for c in range(5):
+                    if mac_ok:
+                        votes[c].append(logical_bits.get(c, 0))
+                    else:
+                        votes[c].append(None)
+
+            for c in range(5):
+                valid = [v for v in votes[c] if v is not None]
+                if valid:
+                    channel_bits[c].append(max(set(valid), key=valid.count))
+                else:
+                    channel_bits[c].append(0)
+                    for rep in range(repetitions):
+                        row_idx = bit_idx * repetitions + rep
+                        if row_idx < len(slot_payload_ids):
+                            channel_erasures[c].append(bit_idx * repetitions + rep)
+
+        channel_bytes = {}
+        for c in range(5):
+            bits = channel_bits[c]
+            channel_bytes[c] = bytes(
+                int(''.join(str(b) for b in bits[i:i+8]), 2)
+                for i in range(0, len(bits), 8)
+                if i + 8 <= len(bits)
+            )
+        return channel_bytes, channel_erasures
+
+    def _write_sys_cache_slot_v8(self, cursor, channel_blocks, slot_payload_ids):
+        """Override: include integer_channel_field in SELECT/UPDATE when active."""
+        icf = (self._carrier_config.integer_channel_field
+               if self._use_integer_ch0 and self._carrier_config else "")
+        channel_bits_dict = {}
+        for c in range(5):
+            bits = []
+            for byte_val in channel_blocks.get(c, b""):
+                bits.extend([int(b) for b in format(byte_val, "08b")])
+            channel_bits_dict[c] = bits
+
+        max_bits = max(len(b) for b in channel_bits_dict.values()) if channel_bits_dict else 0
+        if max_bits == 0:
+            return
+        for c in range(5):
+            if c not in channel_bits_dict:
+                pad_len = max_bits
+                channel_bits_dict[c] = [int(b) for b in format(int.from_bytes(os.urandom((pad_len+7)//8), 'big'), f'0{pad_len}b')][:pad_len]
+            else:
+                pad_len = max_bits - len(channel_bits_dict[c])
+                if pad_len > 0:
+                    random_pad = [int(b) for b in format(int.from_bytes(os.urandom((pad_len+7)//8), 'big'), f'0{pad_len}b')][:pad_len]
+                    channel_bits_dict[c] = channel_bits_dict[c] + random_pad
+
+        available_rows = len(slot_payload_ids)
+        repetitions = self._get_dynamic_repetitions(max_bits, available_rows, self._current_min_repetitions)
+        if max_bits * repetitions > available_rows:
+            repetitions = max(1, available_rows // max_bits)
+            if max_bits * repetitions > available_rows:
+                repetitions = 1
+                max_bits = available_rows
+
+        select_cols = "id, bio, trust_score, profile_score, avatar_url"
+        if icf:
+            select_cols += f", {icf}"
+        placeholders = ','.join(['?'] * len(slot_payload_ids))
+        cursor.execute(
+            f"SELECT {select_cols} FROM {self.AUX_TABLE} WHERE id IN ({placeholders}) ORDER BY id",
+            slot_payload_ids
+        )
+        rows = cursor.fetchall()
+        row_map = {}
+        for r in rows:
+            rid, bio, score, ps, av = r[0], r[1], r[2], r[3], (r[4] or "")
+            iv = int(r[5]) if icf and len(r) > 5 and r[5] is not None else 0
+            row_map[rid] = (bio, score, ps, av, iv)
+
+        slot_idx = self._get_slot_idx_for_row(slot_payload_ids[0]) if slot_payload_ids else 0
+        _, k_hm = self._get_slot_keys(slot_idx)
+
+        update_buffer = []
+        manifest_buffer = []
+        for bit_idx in range(max_bits):
+            for rep in range(repetitions):
+                row_idx = bit_idx * repetitions + rep
+                if row_idx >= len(slot_payload_ids):
+                    break
+                rid = slot_payload_ids[row_idx]
+                row_data = row_map.get(rid)
+                if not row_data:
+                    continue
+                bio, score, ps, av, iv = row_data
+
+                logical_bits = {
+                    0: channel_bits_dict[0][bit_idx],
+                    1: channel_bits_dict[1][bit_idx],
+                    2: channel_bits_dict[2][bit_idx],
+                    3: channel_bits_dict[3][bit_idx],
+                    4: channel_bits_dict[4][bit_idx],
+                }
+
+                nb, ns, np, na, niv = self._encode_all_columns_shuffled(
+                    rid, bio, score, ps, logical_bits, avatar_url=av,
+                    integer_channel_value=iv
+                )
+
+                row_mac = self._compute_row_mac_from_logical_bits(rid, logical_bits, k_hm)
+
+                update_vals = [nb, ns, np, na]
+                if icf:
+                    update_vals.append(niv)
+                update_vals.append(rid)
+                update_buffer.append(update_vals)
+                manifest_buffer.append((rid, row_mac))
+
+        set_clause = "bio=?, trust_score=?, profile_score=?, avatar_url=?"
+        if icf:
+            set_clause += f", {icf}=?"
+        cursor.executemany(
+            f"UPDATE {self.AUX_TABLE} SET {set_clause} WHERE id=?",
+            update_buffer
+        )
+        cursor.executemany(
+            f"INSERT OR REPLACE INTO {self.AUX_MANIFEST_TABLE} (id, row_mac, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            manifest_buffer
+        )
 
     def _write_event_to_slots(self, cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences):
         """V9: Carrier writes are handled by the Interceptor's intercept() loop.
@@ -438,6 +709,9 @@ class _V9Engine(GhostAuditV7):
         self._load_key_evolve_state()
         self._load_metronome_state()
         self.conn.commit()
+
+        # Resolve integer channel availability before manifest rebuild
+        self._resolve_integer_ch0()
 
         # Build manifest from existing carrier rows
         self._rebuild_sys_cache_manifest()
@@ -1049,6 +1323,8 @@ class GhostAuditInterceptor:
             self._carrier_schema_version = 2
             self._save_scheduler_state()
 
+        self._resolve_channels()
+
         self._witness = TimestampWitness(
             db_path=db_path,
             evolve_path=self._evolve_path,
@@ -1200,6 +1476,23 @@ class GhostAuditInterceptor:
     def get_capacity_metrics(self) -> dict:
         self._capacity_metrics["queue_size"] = len(self._payload_queue)
         return dict(self._capacity_metrics)
+
+    # ------------------------------------------------------------------ channel resolution
+
+    def _resolve_channels(self) -> None:
+        field = self.config.integer_channel_field
+        if not field:
+            return
+        if self._engine._use_integer_ch0 and self.verbose:
+            print(f"[V9] Ch0: Integer-Kanal aktiv auf Feld '{field}'.")
+        elif not self._engine._use_integer_ch0:
+            print(
+                f"[V9] Ch0: Feld '{field}' fehlt in Tabelle '{self.config.table}'. "
+                f"Fallback auf Synonym-Switching — statistisch detektierbar. "
+                f"Führe ALTER TABLE manuell aus:\n"
+                f"  ALTER TABLE {self.config.table} "
+                f"ADD COLUMN {field} INTEGER DEFAULT 0;"
+            )
 
     # ------------------------------------------------------------------ carrier row index
 
@@ -1454,9 +1747,11 @@ class GhostAuditInterceptor:
             til = fields_written.get(cfg.tilde_field, "")
             ts_raw = fields_written.get(cfg.timestamp_field) if cfg.timestamp_field else None
             ts_val = self._parse_timestamp_to_int(ts_raw) if ts_raw is not None else None
+            iv_raw = fields_written.get(cfg.integer_channel_field) if cfg.integer_channel_field else None
+            iv_val = int(iv_raw) if iv_raw is not None else None
 
             expected_mac = self._engine._sys_cache_row_mac(
-                row_id, bio, fa, fb, til, ts_val,
+                row_id, bio, fa, fb, til, ts_val, iv_val,
             )
 
             if pending == expected_mac:
@@ -1618,7 +1913,10 @@ class GhostAuditInterceptor:
 
             # Only modify the ONE physical carrier that maps to our target channel
             if physical_idx == 0:
-                if sem in result and result[sem] is not None:
+                if self._engine._use_integer_ch0 and cfg.integer_channel_field in result:
+                    current = int(result.get(cfg.integer_channel_field, 0) or 0)
+                    result[cfg.integer_channel_field] = (current & ~1) | (bit & 1)
+                elif sem in result and result[sem] is not None:
                     if self._calibrated:
                         result[sem] = self._calibrator.encode_bit(result[sem], bit)
                     else:
@@ -1677,6 +1975,8 @@ class GhostAuditInterceptor:
             # creates a MAC mismatch → erasure → RAID-6 recovery.
             ts_raw = result.get(cfg.timestamp_field) if cfg.timestamp_field else None
             ts_val = self._parse_timestamp_to_int(ts_raw) if ts_raw is not None else None
+            iv_raw = result.get(cfg.integer_channel_field) if cfg.integer_channel_field else None
+            iv_val = int(iv_raw) if iv_raw is not None else None
             new_mac = self._engine._sys_cache_row_mac(
                 row_id,
                 result.get(cfg.semantic_field, ""),
@@ -1684,6 +1984,7 @@ class GhostAuditInterceptor:
                 result.get(cfg.float_b_field, 0.0),
                 result.get(cfg.tilde_field, ""),
                 ts_val,
+                iv_val,
             )
             self._engine._set_sys_cache_write_mode(True, commit=False)
             try:
@@ -2016,13 +2317,18 @@ class GhostAuditInterceptor:
             header_ids   = slot_ids[:hdr_count]
             payload_ids  = slot_ids[hdr_count:]
 
-            # ---- Build SELECT fields (all carriers + optional timestamp) ----
+            # ---- Build SELECT fields (all carriers + optional fields) ----
             sel_fields = [
                 cfg.id_field, cfg.semantic_field,
                 cfg.float_a_field, cfg.float_b_field, cfg.tilde_field,
             ]
             if cfg.timestamp_field and cfg.timestamp_field not in sel_fields:
                 sel_fields.append(cfg.timestamp_field)
+            if cfg.integer_channel_field and cfg.integer_channel_field not in sel_fields:
+                cursor.execute(f"PRAGMA table_info({cfg.table})")
+                avail = {r[1] for r in cursor.fetchall()}
+                if cfg.integer_channel_field in avail:
+                    sel_fields.append(cfg.integer_channel_field)
             sel_cols = ', '.join(sel_fields)
 
             # ---- Decode header bits ----
@@ -2107,14 +2413,19 @@ class GhostAuditInterceptor:
                 if not row:
                     continue
                 _, bio, fa, fb, til = row[:5]
+                col_idx = 5
                 has_ts = bool(cfg.timestamp_field)
-                ts_val = self._parse_timestamp_to_int(row[5]) if has_ts and len(row) > 5 else None
+                ts_val = self._parse_timestamp_to_int(row[col_idx]) if has_ts and len(row) > col_idx else None
+                col_idx += 1 if has_ts else 0
+                has_ic = bool(cfg.integer_channel_field) and e._use_integer_ch0
+                iv_val = int(row[col_idx]) if has_ic and len(row) > col_idx and row[col_idx] is not None else None
                 
                 # Verify Row-MAC before extracting bits (Vector A resilience)
                 # If tampering is detected, we skip the row, which turns the error
                 # into an erasure for the RS decoder.
                 if not e._verify_sys_cache_row(rid, bio, fa, profile_score=fb, avatar_url=til,
-                                               timestamp_value=ts_val):
+                                               timestamp_value=ts_val,
+                                               integer_channel_value=iv_val):
                     if self.verbose:
                         print(f"[V9 DEBUG] Row MAC failed for rid={rid} - turning into erasure")
                     continue
@@ -2133,9 +2444,12 @@ class GhostAuditInterceptor:
                 if physical_idx == -1: continue
 
                 bit = None
-                if physical_idx == 0: # semantic
-                    bit = (self._calibrator.decode_bit(bio) if self._calibrated 
-                           else StegoEngine.decode_bit_semantic(bio))
+                if physical_idx == 0:
+                    if e._use_integer_ch0 and cfg.integer_channel_field:
+                        bit = iv_val & 1
+                    else:
+                        bit = (self._calibrator.decode_bit(bio) if self._calibrated 
+                               else StegoEngine.decode_bit_semantic(bio))
                 elif physical_idx == 1: # float_a
                     bit = StegoEngine.decode_bit_float_lsb(fa, scale=self._float_calibrator.best_scale)
                 elif physical_idx == 2: # timestamp_lsb or text_shape fallback

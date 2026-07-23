@@ -71,6 +71,7 @@ class CarrierConfig:
     float_b_field: str
     tilde_field: str
     timestamp_field: str = ""
+    integer_channel_field: str = ""
     float_a_range: tuple = (0.0, 1.0)
     float_b_range: tuple = (0.0, 1.0)
     slot_size: int = 1600
@@ -120,6 +121,7 @@ class CarrierConfig:
             self.float_b_field,
             self.tilde_field,
             self.timestamp_field,
+            self.integer_channel_field,
         ]:
             if f not in seen:
                 seen[f] = True

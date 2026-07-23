@@ -712,6 +712,226 @@ def test_external_carrier_intercept_and_log():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_integer_channel_resolves_column():
+    """_resolve_channels detects integer_channel_field and sets the flag."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        # Add ui_prefs column
+        con = sqlite3.connect(db, timeout=30)
+        con.execute("ALTER TABLE users ADD COLUMN ui_prefs INTEGER DEFAULT 0")
+        con.commit()
+        con.close()
+
+        cfg = CarrierConfig(
+            table="users", id_field="id", semantic_field="bio",
+            float_a_field="trust_score", float_b_field="profile_score",
+            tilde_field="avatar_url", integer_channel_field="ui_prefs",
+            slot_size=5000, slot_count=1,
+        )
+        ga = GhostAuditInterceptor(
+            db_path=db, carrier_config=cfg,
+            force_reinit=True, verbose=False,
+            temporal_delay_rows=0, target_spread_factor=0,
+        )
+        assert ga._engine._use_integer_ch0
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_integer_channel_fallback_when_column_missing():
+    """When integer_channel_field column doesn't exist, fallback to semantic Ch0."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+
+        cfg = CarrierConfig(
+            table="users", id_field="id", semantic_field="bio",
+            float_a_field="trust_score", float_b_field="profile_score",
+            tilde_field="avatar_url", integer_channel_field="ui_prefs",
+            slot_size=5000, slot_count=1,
+        )
+        ga = GhostAuditInterceptor(
+            db_path=db, carrier_config=cfg,
+            force_reinit=True, verbose=False,
+            temporal_delay_rows=0, target_spread_factor=0,
+        )
+        assert not ga._engine._use_integer_ch0
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_integer_channel_write_to_field_instead_of_bio():
+    """Ch0 bit is written to integer field LSB, bio stays unchanged."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        con = sqlite3.connect(db, timeout=30)
+        con.execute("ALTER TABLE users ADD COLUMN ui_prefs INTEGER DEFAULT 0")
+        con.commit()
+        con.close()
+
+        cfg = CarrierConfig(
+            table="users", id_field="id", semantic_field="bio",
+            float_a_field="trust_score", float_b_field="profile_score",
+            tilde_field="avatar_url", integer_channel_field="ui_prefs",
+            slot_size=5000, slot_count=1,
+        )
+        ga = GhostAuditInterceptor(
+            db_path=db, carrier_config=cfg,
+            force_reinit=True, verbose=False,
+            temporal_delay_rows=0, target_spread_factor=0,
+        )
+        ga.calibrate()
+
+        fields = {"bio": "She is currently working on the platform.",
+                  "trust_score": 0.75, "profile_score": 0.50,
+                  "avatar_url": "https://cdn.example.com/1.jpg",
+                  "ui_prefs": 2}   # binary 10 — LSB = 0
+
+        original_bio = fields["bio"]
+        original_ui = fields["ui_prefs"]
+
+        # Log an event so bits are pending
+        ga.log_event("test")
+
+        # Use a payload row (not header row). Row 73 is the first payload row.
+        result = ga.intercept_result(73, fields)
+
+        # bio must never change when integer_ch0 is active
+        assert result.fields["bio"] == original_bio, "bio must not change with integer Ch0"
+
+        # ui_prefs must only have its LSB modified (bits 1+ unchanged)
+        assert result.fields["ui_prefs"] in (original_ui, original_ui ^ 1), (
+            f"ui_prefs changed to {result.fields['ui_prefs']}, expected {original_ui} or {original_ui ^ 1}"
+        )
+
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_integer_channel_roundtrip():
+    """Full write→recover cycle preserves data with integer Ch0."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        con = sqlite3.connect(db, timeout=30)
+        con.execute("ALTER TABLE users ADD COLUMN ui_prefs INTEGER DEFAULT 0")
+        con.commit()
+        con.close()
+
+        cfg = CarrierConfig(
+            table="users", id_field="id", semantic_field="bio",
+            float_a_field="trust_score", float_b_field="profile_score",
+            tilde_field="avatar_url", integer_channel_field="ui_prefs",
+            slot_size=5000, slot_count=1,
+        )
+        ga = GhostAuditInterceptor(
+            db_path=db, carrier_config=cfg,
+            force_reinit=True, verbose=False,
+            temporal_delay_rows=0, target_spread_factor=0,
+        )
+        ga.calibrate()
+
+        ga.log_event("user=alice action=login")
+
+        con = sqlite3.connect(db, timeout=30)
+        rows = con.execute("SELECT id, bio, trust_score, profile_score, avatar_url, ui_prefs FROM users ORDER BY id").fetchall()
+        con.close()
+
+        for row in rows:
+            rid, bio, ts, ps, av, uip = row
+            fields = {"bio": bio, "trust_score": ts,
+                      "profile_score": ps, "avatar_url": av,
+                      "ui_prefs": uip or 0}
+            result = ga.intercept(rid, fields)
+
+            con2 = sqlite3.connect(db, timeout=30)
+            con2.execute("PRAGMA journal_mode=WAL")
+            con2.execute(
+                "UPDATE users SET bio=?, trust_score=?, profile_score=?, avatar_url=?, ui_prefs=? WHERE id=?",
+                (result["bio"], result["trust_score"],
+                 result["profile_score"], result["avatar_url"],
+                 result["ui_prefs"], rid),
+            )
+            con2.commit()
+            con2.close()
+
+            if ga.pending_bit_count() == 0:
+                break
+
+        assert ga.pending_bit_count() == 0
+
+        recovered = ga.recover_events()
+        assert len(recovered) >= 1
+        assert any("alice" in msg for _, msg in recovered)
+
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_semantic_ch0_roundtrip_without_integer_field():
+    """When integer_channel_field is empty, synonym Ch0 roundtrip still works."""
+    d = _tmpdir()
+    try:
+        db = _make_app_db(d)
+        cfg = CarrierConfig(
+            table="users", id_field="id", semantic_field="bio",
+            float_a_field="trust_score", float_b_field="profile_score",
+            tilde_field="avatar_url",
+            integer_channel_field="",
+            slot_size=5000, slot_count=1,
+        )
+        ga = GhostAuditInterceptor(
+            db_path=db, carrier_config=cfg,
+            force_reinit=True, verbose=False,
+            temporal_delay_rows=0, target_spread_factor=0,
+        )
+        ga.calibrate()
+        assert not ga._engine._use_integer_ch0
+
+        ga.log_event("fallback test message")
+
+        con = sqlite3.connect(db, timeout=30)
+        rows = con.execute(
+            "SELECT id, bio, trust_score, profile_score, avatar_url "
+            "FROM users ORDER BY id"
+        ).fetchall()
+        con.close()
+
+        for rid, bio, ts, ps, av in rows:
+            fields = {"bio": bio, "trust_score": ts,
+                      "profile_score": ps, "avatar_url": av}
+            r = ga.intercept_result(rid, fields)
+
+            con2 = sqlite3.connect(db, timeout=30)
+            con2.execute("PRAGMA journal_mode=WAL")
+            con2.execute(
+                "UPDATE users SET bio=?, trust_score=?, profile_score=?, avatar_url=? WHERE id=?",
+                (r.fields["bio"], r.fields["trust_score"],
+                 r.fields["profile_score"], r.fields["avatar_url"], rid),
+            )
+            con2.commit()
+            con2.close()
+
+            if ga.pending_bit_count() == 0:
+                break
+
+        assert ga.pending_bit_count() == 0
+
+        recovered = ga.recover_events()
+        assert len(recovered) >= 1
+        assert any("fallback" in msg for _, msg in recovered)
+
+        ga.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_app_table_write_is_single_statement():
     """After intercept(), the app makes ONE update — no double-write."""
     d = _tmpdir()
@@ -777,6 +997,11 @@ if __name__ == "__main__":
         test_external_carrier_no_write_gate_on_app_table,
         test_external_carrier_intercept_and_log,
         test_app_table_write_is_single_statement,
+        test_integer_channel_resolves_column,
+        test_integer_channel_fallback_when_column_missing,
+        test_integer_channel_write_to_field_instead_of_bio,
+        test_integer_channel_roundtrip,
+        test_semantic_ch0_roundtrip_without_integer_field,
     ]
     passed = failed = 0
     for t in tests:
