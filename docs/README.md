@@ -651,12 +651,21 @@ status = ga.get_witness_status()
 #     "evolve_path": "app.evolve",
 #     "pending_count": 0,                # noch nicht an TSA gesendet
 #     "total_entries": 42,
+#     "oldest_pending_age_ms": 0,        # 0 = keine pending
+#     "health": "healthy",                # healthy | degraded | stale
+#     "max_pending_age_s": 300,          # 5 min bis stale
 #     "recent": [
 #         {"seq": 42, "state": "confirmed", "tsa_url": "...", "confirmed_at": ...},
 #         {"seq": 41, "state": "pending", "tsa_url": "", "confirmed_at": 0},
 #     ],
 #     "thread_alive": True,
 # }
+```
+
+**Health-Zustände:**
+- `healthy` — keine pending Entries, alles sauber
+- `degraded` — pending Entries, aber jünger als `max_pending_age` (5 min) → TSA kurzzeitig nicht erreichbar
+- `stale` — älteste pending Entry älter als `max_pending_age` → TSA länger ausgefallen, **einmalige Warnung via logger**
 ```
 ```
 

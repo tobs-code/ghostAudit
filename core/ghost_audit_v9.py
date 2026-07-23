@@ -1030,6 +1030,7 @@ class GhostAuditInterceptor:
             conn=self._engine.conn,
             evolve_path=self._evolve_path,
             poll_interval=30.0,
+            max_pending_age=300.0,
         )
 
         # For external carrier: populate _orig_ids from real table rows

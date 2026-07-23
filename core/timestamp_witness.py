@@ -136,14 +136,17 @@ class TimestampWitness:
         conn: Any,
         evolve_path: str | None = None,
         poll_interval: float = 30.0,
+        max_pending_age: float = 300.0,
     ):
         self._conn = conn
         self._evolve_path = evolve_path
         self._poll_interval = poll_interval
+        self._max_pending_age = max_pending_age
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._tsa_list: list[tuple[str, bytes]] = TSA_LIST[:]
+        self._warned_stale = False
 
         self._ensure_table()
         if self._evolve_path:
@@ -299,9 +302,8 @@ class TimestampWitness:
             f"SELECT seq, state, tsa_url, confirmed_at FROM {WITNESS_QUEUE_TABLE} "
             f"ORDER BY seq DESC LIMIT 5"
         )
-        rows = cur.fetchall()
         entries = []
-        for row in rows:
+        for row in cur.fetchall():
             entries.append({
                 "seq": row[0],
                 "state": row[1],
@@ -309,16 +311,44 @@ class TimestampWitness:
                 "confirmed_at": row[3] or 0,
             })
         cur.execute(
+            f"SELECT MIN(submitted_at) FROM {WITNESS_QUEUE_TABLE} WHERE state='pending'"
+        )
+        oldest_pending_submitted = cur.fetchone()[0]
+        cur.execute(
             f"SELECT COUNT(*) FROM {WITNESS_QUEUE_TABLE} WHERE state='pending'"
         )
         pending_count = cur.fetchone()[0]
         cur.execute(
             f"SELECT COUNT(*) FROM {WITNESS_QUEUE_TABLE}"
         )
+        total_entries = cur.fetchone()[0]
+
+        now_ms = int(time.time() * 1000)
+        oldest_pending_age_ms = (now_ms - oldest_pending_submitted) if oldest_pending_submitted else 0
+
+        if pending_count == 0:
+            health = "healthy"
+            self._warned_stale = False
+        elif oldest_pending_age_ms < self._max_pending_age * 1000:
+            health = "degraded"
+            self._warned_stale = False
+        else:
+            health = "stale"
+            if not self._warned_stale:
+                logger.warning(
+                    "Witness stale: %d pending entries, oldest %.0fs old (max %.0fs). "
+                    "TSA may be unreachable.",
+                    pending_count, oldest_pending_age_ms / 1000, self._max_pending_age,
+                )
+                self._warned_stale = True
+
         return {
             "evolve_path": self._evolve_path,
             "pending_count": pending_count,
-            "total_entries": cur.fetchone()[0],
+            "total_entries": total_entries,
+            "oldest_pending_age_ms": oldest_pending_age_ms,
+            "health": health,
+            "max_pending_age_s": self._max_pending_age,
             "recent": entries,
             "thread_alive": self._thread is not None and self._thread.is_alive(),
         }
