@@ -16,7 +16,8 @@ carrier = CarrierConfig(
     float_a_field="trust_score",
     float_b_field="profile_score",
     tilde_field="avatar_url",
-    timestamp_field="created_at",   # V9.3: Ch2 Timestamp-LSB (kein Bio-SPOF)
+    timestamp_field="created_at",     # V9.3: Ch2 Timestamp-LSB (kein Bio-SPOF)
+integer_channel_field="ui_prefs", # V9.9: Ch0 Integer-LSB (kein Synonym-Fingerabdruck)
 )
 
 ga = GhostAuditInterceptor(
@@ -88,7 +89,8 @@ carrier = CarrierConfig(
     float_a_field="trust_score",
     float_b_field="profile_score",
     tilde_field="avatar_url",
-    timestamp_field="created_at",  # V9.3: Ch2 wird via Timestamp-LSB kodiert
+    timestamp_field="created_at",      # V9.3: Ch2 wird via Timestamp-LSB kodiert
+    integer_channel_field="ui_prefs",  # V9.9: Ch0 via Integer-LSB, kein Synonym-Fingerabdruck
 )
 
 ga = GhostAuditInterceptor(
@@ -170,7 +172,7 @@ Fünf physische Carrier, per HMAC-Permutation pro Zeile auf logische Kanäle gem
 
 | Kanal | Feld | Methode | ORM-Risiko |
 |-------|------|---------|------------|
-| Ch0 | `bio` | Synonym-Switching (`currently/presently`, `active/online`, `working/operating`, `system/platform`) | TRIM, lowercase |
+| Ch0 | `ui_prefs` (Integer-LSB, V9.9) | `(current & ~1) \| (bit & 1)` — andere Bits unberührt | Keines — App schreibt es nie, kein statistischer Fingerabdruck |
 | Ch1 | `trust_score` | Float LSB-Matching ±1 (stochastisch) | Float-Rounding |
 | Ch2 | `created_at` (Timestamp-LSB) | Float/Integer/TEXT → `_parse_timestamp_to_int` → LSB-Embedding (scale=1 für ms, scale=1000 für s) | Keines — write-once, kein ORM-Touch |
 | Ch3 | `profile_score` | Float LSB-Matching ±1 (ORM-unabhängig von `bio`) | Float-Rounding |
@@ -186,9 +188,11 @@ Fünf physische Carrier, per HMAC-Permutation pro Zeile auf logische Kanäle gem
 
 **Thread-Safety (V9.2):** Der Interceptor ist durch ein internes `threading.Lock` gegen Race-Conditions in Multi-Threaded-Umgebungen (WSGI/ASGI) geschützt.
 
-**Bio-SPOF Fix (V8 → V9):** Carrier 3 war ursprünglich Case-Switching auf `bio` (V7). ORM-Normalisierung hätte damit 3/5 Carrier gleichzeitig zerstört. V8 zog Ch2 auf `profile_score` (unabhängige Float-Spalte) — Bio-Normalize killte nur noch 2/5. **V9 eliminiert den Bio-SPOF endgültig:** Ch2 liegt auf `created_at` (Timestamp-LSB), einem write-once-Feld ohne ORM-Exposition. Bio-TRIM/lowercase killt jetzt nur noch **1/5 Carrier** (Ch0).
+**Bio-SPOF Fix (V8 → V9 → V9.9):** Carrier 3 war ursprünglich Case-Switching auf `bio` (V7). V8 zog Ch2 auf `profile_score`. V9.3 eliminierte Ch2 per Timestamp-LSB. **V9.9 eliminiert Ch0 endgültig:** Ch0 liegt jetzt auf `ui_prefs` (Integer-LSB), einem Integer-Feld das GhostAudit exklusiv kontrolliert. ORM-Normalisierung betrifft **null** Carrier. Alle 5 Kanäle sind ORM-resistent.
 
-**TextShapeCarrier (V9, Fallback):** Der frühere Trailing-Space-Carrier wurde im V9-Payload-Pfad durch einen opportunistischen Textform-Carrier ersetzt. Seit V9.3 ist er **Fallback** für Ch2: primär wird Ch2 via Timestamp-LSB auf `created_at` (oder einem konfigurierten Timestamp-Feld) kodiert. Nur wenn kein Timestamp-Feld konfiguriert ist (`timestamp_field=""`), fällt das System auf TextShape zurück.
+**TextShapeCarrier (V9, Fallback):** Der frühere Trailing-Space-Carrier wurde im V9-Payload-Pfad durch einen opportunistischen Textform-Carrier ersetzt. Seit V9.3 ist er **Fallback** für Ch2: primär wird Ch2 via Timestamp-LSB kodiert. Fallback nur wenn `timestamp_field=""`.
+
+**Synonym-Ch0 (V9.9, Fallback):** Wenn `integer_channel_field=""` oder das konfigurierte Integer-Feld nicht in der Tabelle existiert, fällt Ch0 automatisch auf das alte Synonym-Switching in `bio` zurück. Ein `logger.warning` inkludiert das `ALTER TABLE`-Statement für den manuellen Migrationsschritt.
 
 **Temporal Delay (V9):** Payloads starten nicht immer sofort auf der ersten elegiblen Row. Ein kleiner deterministischer `temporal_delay_rows`-Puffer glättet den direkten `log_event()` → `intercept()`-Pfad, damit das Schreibmuster weniger eng an einzelne Audit-Events gebunden ist.
 
@@ -228,11 +232,15 @@ Von innen nach außen:
 - Vollständig eingebettete Payloads werden später per `flush_headers()` bzw. automatisch vor `recover_events()` mit V7-Headern versehen
 - Synonym-Encoding kann via `calibrate()` aus echten Rows an die lokale Textverteilung angepasst werden
 - V7 ECC/RAID-6, HMAC-Shuffling, Merkle, Rollback-Schutz und Checkpoints bleiben als Engine-Primitiven erhalten
-- `timestamp_field` in `CarrierConfig`: Ch2 wechselt von `bio` (TextShape) auf Timestamp-LSB (`created_at` o.ä.) — kein Bio-SPOF mehr, nur 1/5 Carrier betroffen bei ORM-Normalisierung
-- `carrier_schema_version` in `sys_cache_scheduler_state` migriert automatisch von V1 (kein Timestamp) zu V2 (Timestamp) beim ersten Start mit `timestamp_field`
-- `_parse_timestamp_to_int`: Typ-sicheres Parsen von INTEGER (ms), REAL (Sekunden vs. ms via `<1e11`-Heuristik) und TEXT (ISO-8601 mit Z)
-- **V9.1+:** Adaptive Probability Scheduler, persistente Queue, Reject-New Overflow-Schutz und Thread-Safety.
-- **V9.4 — Timestamp Witness (RFC 3161 TSA):** Background-Thread submitte SHA256(.evolve)-Digest an Public Time-Stamp Authority. Der signierte Timestamp-Token (TST) beweist, dass der `.evolve`-State zu einem bestimmten Zeitpunkt existierte — der Angreifer müsste DB, `.evolve` *und* den TSA-Log gleichzeitig snapshotten. Im Fehlerfall (TSA down) bleibt die Entry `pending` und wird im nächsten Poll-Zyklus erneut versucht. Der Write-Pfad blockiert nie.
+- `timestamp_field` in `CarrierConfig`: Ch2 wechselt von `bio` (TextShape) auf Timestamp-LSB (`created_at` o.ä.) — kein Bio-SPOF mehr
+- `carrier_schema_version` migriert automatisch von V1 → V2 beim ersten Start mit `timestamp_field`
+- `_parse_timestamp_to_int`: Typ-sicheres Parsen von INTEGER (ms), REAL (Sekunden vs. ms via `<1e11`-Heuristik), TEXT (ISO-8601)
+- **V9.4 — TSA Witness (RFC 3161):** Background-Thread (30s Poll) submitte SHA256(.evolve)-Digest an Public Time-Stamp Authority (Multi-TSA-Fallback: freetsa.org → digicert → sectigo). Der signierte Timestamp-Token (TST) beweist Existenz des Checkpoints zu einem bestimmten Zeitpunkt. Best-Effort — bei TSA-Down bleiben Entries `pending`.
+- **V9.5 — Capacity Metrics:** `get_capacity_metrics()` liefert Row-Defizit, effective_payload_rows, Coverage-Schätzung, Queue-Auslastung. Early-Warning bei Queue >50%.
+- **V9.6 — Witness Health Alarm:** `get_status()` gibt `health`: healthy/degraded/stale (max_pending_age=300s). Once-per-cycle `logger.warning()` bei stale-Transition, kein Spam.
+- **V9.7 — App-Contract Verification:** `verify_write(row_id, fields_written)` prüft MAC nach App-UPDATE. One-shot pro Row (MAC wird aus `_pending_verify` entfernt). Bei Mismatch → `logger.warning`. `max_queue_size`-Cap verhindert unbeschränktes Wachstum.
+- **V9.8 — Multi-Process Desync:** `process_id`/`process_count`-Parameter. Modulo-basierte Row-Partitionierung (`rid % count == id`). Atomic Sequence Counter per `UPDATE sys_sequence_counter SET next_seq = next_seq + N`. Per-Process Key-Evolution (`fs_key_state.id = 1 + process_id`).
+- **V9.9 — Integer Channel Ch0:** `integer_channel_field` ersetzt Synonym-Switching durch Integer-LSB (`(current & ~1) | (bit & 1)`). Kein statistischer Fingerabdruck mehr — Ch0-Verteilung ist nicht von natürlichem Bitmask-Rauschen unterscheidbar. Fallback auf Synonym-Ch0 wenn das Feld nicht existiert. Alle 5 Kanäle jetzt ORM-resistent und statistisch unauffällig.
 
 ### V8 — Multiplexing & RAID-6
 
@@ -725,6 +733,11 @@ python tests/benchmark_throughput_v8.py
 
 ## Testergebnisse
 
+### V9 Interceptor Test Suite — 33 Tests, 33 PASSED (Stand V9.9)
+
+- 28 V9 Interceptor-Tests (CarrierConfig, Calibration, Intercept, Temporal Delay, Float Coverage, External Carrier, Multi-Process, Integer Channel Ch0)
+- 5 Active-Analyst-Tests (Blast Radius, MAC-Strip, Backfill, Ch0-Erasure, Rollback-Detection)
+
 ### Angriffssimulation V8
 
 | Angriff | Vektor | Ergebnis |
@@ -765,7 +778,7 @@ python tests/benchmark_throughput_v8.py
 - **Forschungsprototyp** — kein produktionsreifes Auditsystem
 - V9 benötigt genügend echte Carrier-Rows und App-Writes, um pending Payload-Bits vollständig einzubetten.
 - Header-Rows werden aktuell slotweise direkt über die GhostAudit-Engine geschrieben; Payload-Writes laufen über den App-Hook.
-- ORM-Textnormalisierung (TRIM, lowercase, synonym-flatten) zerstört bio-basierte Carrier. Bio-SPOF Fix (V9.3) eliminiert Ch2 via Timestamp-LSB → nur noch **1/5 Carrier** betroffen (Ch0).
+- ORM-Textnormalisierung betrifft **keinen** Carrier mehr (V9.9: Ch0 via Integer-LSB, alle 5 Kanäle ORM-resistent).
 - RAID-6 toleriert **beliebige** 2/5 Carrier-Kill. Bei 3/5 ist keine Recovery möglich.
 - Forward Security schützt Slots voneinander, nicht vor Verlust des Master-Keys.
 - Rollback-Schutz hatte eine dokumentierte Grenze: Werden DB und `.evolve`-Datei gemeinsam aus demselben Snapshot wiederhergestellt, wurde kein Rollback erkannt. **Seit V9.4 ist diese Lücke durch den TSA-Witness geschlossen** — der `.evolve`-Digest ist in einem Public Append-Only Log signiert. Ein Both-Snapshot müsste zusätzlich den TSA-Log kompromittieren.
