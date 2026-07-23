@@ -621,6 +621,28 @@ result = ga.verify_checkpoint(None, path="checkpoint.json")  # aus Datei
 ga.export_recovered_logs("out.jsonl", format="jsonl")
 ga.export_recovered_logs("out.cef",   format="cef")
 
+### Capacity Metrics (V9.5)
+
+```python
+m = ga.get_capacity_metrics()
+# m = {
+#     "total_rows": 200,              # Zeilen in der Carrier-Tabelle
+#     "required_rows": 8000,          # slot_count * slot_size
+#     "deficit": 7800,                # Fehlende Zeilen
+#     "capacity_pct": 2.5,            # Prozent der benötigten Zeilen
+#     "slot_count": 5,
+#     "slot_size": 1600,
+#     "header_rows_per_slot": 72,
+#     "payload_rows_total": 7640,     # 5 * (1600-72)
+#     "coverage_estimate": 0.04,      # ~4% Rows sind elegibel
+#     "effective_payload_rows": 305,  # payl. * coverage
+#     "queue_size": 0,                # Aktuell eingereihte Events
+#     "max_queue_size": 100,
+# }
+```
+
+Bei einem Defizit >0 wird beim Start (`verbose=True`) eine Capacity-Warnung ausgegeben. Sobald die Queue >50% voll ist, erscheint alle 10 Events eine Early-Warning.
+
 ### Witness-Status (V9.4)
 
 ```python

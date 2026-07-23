@@ -1041,6 +1041,8 @@ class GhostAuditInterceptor:
             self._row_id_index = {rid: idx for idx, rid in enumerate(self._row_id_list)}
             self._carrier_rows_loaded = True
 
+        self._compute_capacity_metrics()
+
     # ------------------------------------------------------------------ persistence
 
     def _load_scheduler_state(self):
@@ -1136,6 +1138,44 @@ class GhostAuditInterceptor:
         cursor = self._engine.conn.cursor()
         cursor.execute("DELETE FROM sys_cache_pending_queue WHERE seq = ?", (seq,))
         self._engine.conn.commit()
+
+    # ------------------------------------------------------------------ capacity metrics
+
+    def _compute_capacity_metrics(self) -> None:
+        cfg = self.config
+        total_rows = len(self._row_id_list)
+        required = cfg.total_carrier_rows
+        deficit = max(0, required - total_rows)
+        capacity_pct = min(100.0, total_rows / required * 100) if required else 0.0
+        payload_rows_total = cfg.slot_count * cfg.payload_rows_per_slot
+        effective = int(payload_rows_total * self.EXTERNAL_COVERAGE_ESTIMATE)
+
+        self._capacity_metrics = dict(
+            total_rows=total_rows,
+            required_rows=required,
+            deficit=deficit,
+            capacity_pct=round(capacity_pct, 1),
+            slot_count=cfg.slot_count,
+            slot_size=cfg.slot_size,
+            header_rows_per_slot=cfg.header_row_count,
+            payload_rows_total=payload_rows_total,
+            coverage_estimate=self.EXTERNAL_COVERAGE_ESTIMATE,
+            effective_payload_rows=effective,
+            queue_size=len(self._payload_queue),
+            max_queue_size=self.max_queue_size,
+        )
+
+        if deficit > 0 and self.verbose:
+            print(
+                f"[V9] Capacity: {total_rows}/{required} rows ({capacity_pct:.0f}%), "
+                f"{deficit} short.  Effective payload rows: ~{effective} "
+                f"(coverage={self.EXTERNAL_COVERAGE_ESTIMATE}). "
+                f"Queue: {len(self._payload_queue)}/{self.max_queue_size}."
+            )
+
+    def get_capacity_metrics(self) -> dict:
+        self._capacity_metrics["queue_size"] = len(self._payload_queue)
+        return dict(self._capacity_metrics)
 
     # ------------------------------------------------------------------ carrier row index
 
@@ -1750,6 +1790,16 @@ class GhostAuditInterceptor:
             self._last_event_time = now
             self._restarted = False
             self._save_scheduler_state()
+
+            # Early-warning: queue >50% full
+            qlen = len(self._payload_queue)
+            if qlen > self.max_queue_size // 2 and self.verbose and qlen % 10 == 0:
+                m = self.get_capacity_metrics()
+                print(
+                    f"[V9] Queue {qlen}/{self.max_queue_size} ({qlen/self.max_queue_size*100:.0f}%). "
+                    f"Effective payload rows: ~{m['effective_payload_rows']}. "
+                    f"Row deficit: {m['deficit']}."
+                )
 
             seqs = self._engine.log_events(event_msgs, immediate_commit=immediate_commit)
 
