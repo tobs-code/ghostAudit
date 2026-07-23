@@ -241,6 +241,11 @@ Von innen nach außen:
 - **V9.7 — App-Contract Verification:** `verify_write(row_id, fields_written)` prüft MAC nach App-UPDATE. One-shot pro Row (MAC wird aus `_pending_verify` entfernt). Bei Mismatch → `logger.warning`. `max_queue_size`-Cap verhindert unbeschränktes Wachstum.
 - **V9.8 — Multi-Process Desync:** `process_id`/`process_count`-Parameter. Modulo-basierte Row-Partitionierung (`rid % count == id`). Atomic Sequence Counter per `UPDATE sys_sequence_counter SET next_seq = next_seq + N`. Per-Process Key-Evolution (`fs_key_state.id = 1 + process_id`).
 - **V9.9 — Integer Channel Ch0:** `integer_channel_field` ersetzt Synonym-Switching durch Integer-LSB (`(current & ~1) | (bit & 1)`). Kein statistischer Fingerabdruck mehr — Ch0-Verteilung ist nicht von natürlichem Bitmask-Rauschen unterscheidbar. Fallback auf Synonym-Ch0 wenn das Feld nicht existiert. Alle 5 Kanäle jetzt ORM-resistent und statistisch unauffällig.
+- **V9.10 — Carrier Discovery:** `ghostaudit discover app.db users` → PRAGMA-basierter Schema-Scanner. Whitelist-Pattern-Matching für alle Carrier-Rollen mit Confidence-Scoring (0–100). `CarrierConfig.from_config_dict()` baut Config aus JSON. `schema_version` im generated Config.
+- **V9.11 — Metriken:** `MetricRegistry(ABC)` mit `NoopMetricRegistry` (zero overhead) und `PrometheusMetricRegistry` (prometheus_client). Drei Metriken im Interceptor: `carrier_erasure_total{channel}`, `recovery_total{status}`, `pending_payloads` (Gauge).
+- **V9.12 — try_flush():** Size-Trigger (`auto_flush_completed`, default 5) und Time-Trigger (`auto_flush_interval`, default 2.0s). Kein Timer-Daemon — embedded-library-safe. Aufruf nach `intercept_result()` und `_enqueue_event_bits()`.
+- **V9.13 — API-Glättung:** `CarrierConfig.from_config_dict(d)` filtert `schema_version`. `log_structured_event(**kwargs)` serialisiert nach JSON. QUICKSTART.md: 6 Schritte, erster Audit-Event in 5 Minuten.
+- **V9.14 — Docstrings:** Happy-Path in der Klasse, vollständiger `__init__`-Docstring (20 Parameter). Alle public-Methoden englisch, mit Return-Format und Querverweisen.
 
 ### V8 — Multiplexing & RAID-6
 
@@ -733,10 +738,12 @@ python tests/benchmark_throughput_v8.py
 
 ## Testergebnisse
 
-### V9 Interceptor Test Suite — 33 Tests, 33 PASSED (Stand V9.9)
+### V9 Integration Test Suite — 49 Tests, 49 PASSED (Stand V9.14)
 
-- 28 V9 Interceptor-Tests (CarrierConfig, Calibration, Intercept, Temporal Delay, Float Coverage, External Carrier, Multi-Process, Integer Channel Ch0)
+- 33 V9 Interceptor-Tests (CarrierConfig, Calibration, Intercept, Temporal Delay, Float Coverage, External Carrier, Multi-Process, Integer Channel Ch0, MAC-Verify, try_flush)
 - 5 Active-Analyst-Tests (Blast Radius, MAC-Strip, Backfill, Ch0-Erasure, Rollback-Detection)
+- 7 Discovery-Tests (PRAGMA, Pattern-Matching, Warning-Branches, generated Config)
+- 4 Metric-Tests (Noop-Registry, Interceptor-Integration, Size-Trigger, Time-Trigger)
 
 ### Angriffssimulation V8
 
@@ -821,6 +828,7 @@ tests/
 
 docs/
 ├── README.md                  Diese Datei
+├── QUICKSTART.md              Erster Audit-Event in 5 Minuten (discover → config → intercept → verify → log → recover)
 ├── README_GHOST_AUDIT.md      Ausführliche Vorgänger-Dokumentation
 ├── QUICK_REFERENCE.md         Kurzbefehle auf einen Blick
 ├── TEST_SUITE_OVERVIEW.md     Testfluss und Interpretation
