@@ -97,6 +97,26 @@ class CarrierConfig:
         if lo_b >= hi_b:
             raise ValueError("CarrierConfig: float_b_range must be (low, high) with low < high")
 
+    @classmethod
+    def from_config_dict(cls, d: dict) -> "CarrierConfig":
+        """Build from a discovery dict (schema_version + table werden ignoriert/extrahiert).
+
+        ``d`` kann ``schema_version`` und ``table`` enthalten
+        (z.B. aus ``ghostaudit discover --write config.json``),
+        die werden vor der Konstruktion entfernt.
+        """
+        d = dict(d)
+        d.pop("schema_version", None)
+        table = d.pop("table", None) or "sys_cache"
+        # Nur bekannte Felder übergeben
+        known = {"table", "id_field", "semantic_field", "float_a_field",
+                 "float_b_field", "tilde_field", "timestamp_field",
+                 "integer_channel_field", "float_a_range", "float_b_range",
+                 "slot_size", "slot_count"}
+        kwargs = {k: v for k, v in d.items() if k in known}
+        kwargs.setdefault("table", table)
+        return cls(**kwargs)
+
     @property
     def total_carrier_rows(self) -> int:
         return self.slot_size * self.slot_count

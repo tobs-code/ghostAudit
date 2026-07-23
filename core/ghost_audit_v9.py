@@ -2212,6 +2212,21 @@ class GhostAuditInterceptor:
         return self._log_and_enqueue([event_msg], immediate_commit)[0] \
             if True else None
 
+    def log_structured_event(
+        self, immediate_commit: bool = True, **fields: object
+    ) -> int | None:
+        """Log a structured audit event (kwargs → JSON → ``log_event``).
+
+        >>> interceptor.log_structured_event(
+        ...     event_type="user.profile_update",
+        ...     actor_id=42,
+        ...     target_id=user_id,
+        ... )
+        """
+        import json as _json
+        return self.log_event(_json.dumps(fields, default=str, ensure_ascii=False),
+                              immediate_commit=immediate_commit)
+
     def log_events(
         self, event_msgs: list[str], immediate_commit: bool = True
     ) -> list[int]:
