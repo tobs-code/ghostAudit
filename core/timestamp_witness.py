@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -133,12 +134,12 @@ class WitnessReceipt:
 class TimestampWitness:
     def __init__(
         self,
-        conn: Any,
+        db_path: str,
         evolve_path: str | None = None,
         poll_interval: float = 30.0,
         max_pending_age: float = 300.0,
     ):
-        self._conn = conn
+        self._db_path = db_path
         self._evolve_path = evolve_path
         self._poll_interval = poll_interval
         self._max_pending_age = max_pending_age
@@ -147,8 +148,12 @@ class TimestampWitness:
         self._lock = threading.Lock()
         self._tsa_list: list[tuple[str, bytes]] = TSA_LIST[:]
         self._warned_stale = False
+        self._worker_conn: sqlite3.Connection | None = None
 
-        self._ensure_table()
+        with sqlite3.connect(db_path) as init_conn:
+            init_conn.execute(WITNESS_QUEUE_DDL)
+            init_conn.commit()
+
         if self._evolve_path:
             self.start()
 
@@ -179,37 +184,41 @@ class TimestampWitness:
                 logger.exception("Witness worker error")
 
     def _process_pending(self) -> None:
-        cur = self._conn.cursor()
-        cur.execute(
-            f"SELECT seq, evolve_path, digest_hex FROM {WITNESS_QUEUE_TABLE} "
-            f"WHERE state='pending' ORDER BY seq ASC"
-        )
-        rows = cur.fetchall()
-        if not rows:
-            return
-        for seq, evolve_path, stored_digest in rows:
-            if not evolve_path:
-                continue
-            try:
-                current_digest = self._sha256_file(evolve_path)
-            except (OSError, FileNotFoundError):
-                continue
-            if not current_digest or current_digest != stored_digest:
-                continue
-            receipt = self.submit(seq, evolve_path, current_digest)
-            if receipt is not None:
-                cur.execute(
-                    f"UPDATE {WITNESS_QUEUE_TABLE} SET "
-                    f"state='confirmed', tst_der=?, tsa_url=?, "
-                    f"confirmed_at=? WHERE seq=?",
-                    (
-                        receipt.tst_der,
-                        receipt.tsa_url,
-                        int(time.time() * 1000),
-                        seq,
-                    ),
-                )
-                self._conn.commit()
+        conn = sqlite3.connect(self._db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT seq, evolve_path, digest_hex FROM {WITNESS_QUEUE_TABLE} "
+                f"WHERE state='pending' ORDER BY seq ASC"
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return
+            for seq, evolve_path, stored_digest in rows:
+                if not evolve_path:
+                    continue
+                try:
+                    current_digest = self._sha256_file(evolve_path)
+                except (OSError, FileNotFoundError):
+                    continue
+                if not current_digest or current_digest != stored_digest:
+                    continue
+                receipt = self.submit(seq, evolve_path, current_digest)
+                if receipt is not None:
+                    conn.execute(
+                        f"UPDATE {WITNESS_QUEUE_TABLE} SET "
+                        f"state='confirmed', tst_der=?, tsa_url=?, "
+                        f"confirmed_at=? WHERE seq=?",
+                        (
+                            receipt.tst_der,
+                            receipt.tsa_url,
+                            int(time.time() * 1000),
+                            seq,
+                        ),
+                    )
+                    conn.commit()
+        finally:
+            conn.close()
 
     def add_pending(self, seq: int, evolve_path: str) -> None:
         if not evolve_path:
@@ -220,14 +229,14 @@ class TimestampWitness:
             return
         if not digest_hex:
             return
-        cur = self._conn.cursor()
-        cur.execute(
-            f"INSERT OR REPLACE INTO {WITNESS_QUEUE_TABLE} "
-            f"(seq, evolve_path, digest_hex, state, submitted_at) "
-            f"VALUES (?, ?, ?, 'pending', ?)",
-            (seq, evolve_path, digest_hex, int(time.time() * 1000)),
-        )
-        self._conn.commit()
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                f"INSERT OR REPLACE INTO {WITNESS_QUEUE_TABLE} "
+                f"(seq, evolve_path, digest_hex, state, submitted_at) "
+                f"VALUES (?, ?, ?, 'pending', ?)",
+                (seq, evolve_path, digest_hex, int(time.time() * 1000)),
+            )
+            conn.commit()
 
     def submit(
         self, seq: int, evolve_path: str, digest_hex: str | None = None
@@ -297,31 +306,32 @@ class TimestampWitness:
             return False
 
     def get_status(self) -> dict:
-        cur = self._conn.cursor()
-        cur.execute(
-            f"SELECT seq, state, tsa_url, confirmed_at FROM {WITNESS_QUEUE_TABLE} "
-            f"ORDER BY seq DESC LIMIT 5"
-        )
-        entries = []
-        for row in cur.fetchall():
-            entries.append({
-                "seq": row[0],
-                "state": row[1],
-                "tsa_url": row[2] or "",
-                "confirmed_at": row[3] or 0,
-            })
-        cur.execute(
-            f"SELECT MIN(submitted_at) FROM {WITNESS_QUEUE_TABLE} WHERE state='pending'"
-        )
-        oldest_pending_submitted = cur.fetchone()[0]
-        cur.execute(
-            f"SELECT COUNT(*) FROM {WITNESS_QUEUE_TABLE} WHERE state='pending'"
-        )
-        pending_count = cur.fetchone()[0]
-        cur.execute(
-            f"SELECT COUNT(*) FROM {WITNESS_QUEUE_TABLE}"
-        )
-        total_entries = cur.fetchone()[0]
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT seq, state, tsa_url, confirmed_at FROM {WITNESS_QUEUE_TABLE} "
+                f"ORDER BY seq DESC LIMIT 5"
+            )
+            entries = []
+            for row in cur.fetchall():
+                entries.append({
+                    "seq": row[0],
+                    "state": row[1],
+                    "tsa_url": row[2] or "",
+                    "confirmed_at": row[3] or 0,
+                })
+            cur.execute(
+                f"SELECT MIN(submitted_at) FROM {WITNESS_QUEUE_TABLE} WHERE state='pending'"
+            )
+            oldest_pending_submitted = cur.fetchone()[0]
+            cur.execute(
+                f"SELECT COUNT(*) FROM {WITNESS_QUEUE_TABLE} WHERE state='pending'"
+            )
+            pending_count = cur.fetchone()[0]
+            cur.execute(
+                f"SELECT COUNT(*) FROM {WITNESS_QUEUE_TABLE}"
+            )
+            total_entries = cur.fetchone()[0]
 
         now_ms = int(time.time() * 1000)
         oldest_pending_age_ms = (now_ms - oldest_pending_submitted) if oldest_pending_submitted else 0

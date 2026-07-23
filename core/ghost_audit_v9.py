@@ -1000,6 +1000,7 @@ class GhostAuditInterceptor:
         self._float_calibrator = FloatCalibrator(min_samples=float_warmup_samples)
         self._payload_queue: list[_PendingPayload] = []
         self._completed_payloads: list[_PendingPayload] = []
+        self._pending_verify: dict[Any, bytes] = {}
         self._temporal_delay_rows = max(0, temporal_delay_rows)
         self._float_warmup_samples = max(0, float_warmup_samples)
         self._row_id_list: list[Any] = []
@@ -1027,7 +1028,7 @@ class GhostAuditInterceptor:
             self._save_scheduler_state()
 
         self._witness = TimestampWitness(
-            conn=self._engine.conn,
+            db_path=db_path,
             evolve_path=self._evolve_path,
             poll_interval=30.0,
             max_pending_age=300.0,
@@ -1394,6 +1395,56 @@ class GhostAuditInterceptor:
         """
         return self.intercept_result(row_id, fields).fields
 
+    def verify_write(self, row_id: Any, fields_written: dict[str, Any]) -> bool:
+        """Check whether the written fields match the MAC from ``intercept()``.
+
+        Call this **after** the app UPDATE to verify the App-Contract was honoured.
+        ``fields_written`` must be exactly what was passed to the UPDATE (i.e. the
+        dict returned by ``intercept()``).  A mismatch means the app transformed
+        or dropped carrier fields *after* intercept — the row's MAC will be an
+        erasure on recovery.
+
+        Returns ``True`` if the MAC matches or no write was pending for this row.
+        Returns ``False`` on mismatch (with a ``logger.warning``).
+        This is purely advisory — zero side effects on carrier state.
+        """
+        pending = self._pending_verify.pop(row_id, None)
+        if pending is None:
+            return True  # intercept did not write to this row
+
+        cfg = self.config
+        try:
+            bio = fields_written.get(cfg.semantic_field, "")
+            fa = fields_written.get(cfg.float_a_field, 0.0)
+            fb = fields_written.get(cfg.float_b_field, 0.0)
+            til = fields_written.get(cfg.tilde_field, "")
+            ts_raw = fields_written.get(cfg.timestamp_field) if cfg.timestamp_field else None
+            ts_val = self._parse_timestamp_to_int(ts_raw) if ts_raw is not None else None
+
+            expected_mac = self._engine._sys_cache_row_mac(
+                row_id, bio, fa, fb, til, ts_val,
+            )
+
+            if pending == expected_mac:
+                return True
+
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning(
+                "App-Contract violation on row_id=%s: write MAC mismatch. "
+                "Carrier fields modified after intercept().",
+                row_id,
+            )
+            if self.verbose:
+                print(
+                    f"[V9] WARNING: verify_write(row_id={row_id}) FAILED. "
+                    f"Expected MAC ≠ computed MAC. Carrier fields changed after intercept()."
+                )
+            return False
+        except Exception as exc:
+            if self.verbose:
+                print(f"[V9] verify_write({row_id}) error: {exc}")
+            return False
+
     def _current_embedding_probability(self) -> float:
         """Calculate dynamic p based on rates and target spread.
 
@@ -1609,6 +1660,13 @@ class GhostAuditInterceptor:
                 )
             finally:
                 self._engine._set_sys_cache_write_mode(False, commit=True)
+
+            self._pending_verify[row_id] = new_mac
+            # Cap pending_verify to avoid unbounded growth if caller never calls verify_write
+            if len(self._pending_verify) > self.max_queue_size:
+                overflow = len(self._pending_verify) - self.max_queue_size
+                for k in list(self._pending_verify.keys())[:overflow]:
+                    del self._pending_verify[k]
 
             # If this was the last bit, queue the header for a later flush.
             if payload.exhausted:

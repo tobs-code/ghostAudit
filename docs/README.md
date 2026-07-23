@@ -621,6 +621,19 @@ result = ga.verify_checkpoint(None, path="checkpoint.json")  # aus Datei
 ga.export_recovered_logs("out.jsonl", format="jsonl")
 ga.export_recovered_logs("out.cef",   format="cef")
 
+### App-Contract Verification (V9.7)
+
+```python
+# After intercept() and the app UPDATE, optionally verify the write
+result = ga.intercept(row_id=user_id, fields=fields)
+# → app writes result to DB
+ok = ga.verify_write(row_id=user_id, fields_written=result)
+# True  → MAC matches, contract honoured
+# False → MAC mismatch, app modified carrier fields after intercept
+```
+
+`verify_write` ist **optional** und hat keine Seiteneffekte. Ein Fehlschlag erzeugt einen `logger.warning` und bedeutet: die App hat Carrier-Felder nach `intercept()` verändert oder weggelassen → die Row-MAC passt nicht → Recovery sieht ein Erasure. RAID-6 fängt einzelne Erasures ab, aber der Admin bekommt eine Warnung.
+
 ### Capacity Metrics (V9.5)
 
 ```python
