@@ -1209,8 +1209,19 @@ class _PendingPayload:
 # ---------------------------------------------------------------------------
 
 class GhostAuditInterceptor:
-    """V9 interceptor — wraps a GhostAuditV7 engine and exposes the
-    intercept API for timing-safe single-write stego embedding.
+    """Main entry point for GhostAudit V9.
+
+    Happy path
+    ----------
+    1. ``discover`` → Schema erkennen, ``CarrierConfig.from_config_dict()``
+    2. ``intercept(row_id, fields)`` vor jedem App-UPDATE
+    3. ``verify_write(row_id, fields_written)`` nach jedem App-UPDATE
+    4. ``log_structured_event(**kwargs)`` für Audit-Events
+    5. ``recover_events()`` beim App-Start → alle Events decodiert
+
+    Metriken: ``metric_registry``-Parameter injizieren
+    Flush: ``try_flush()`` wird automatisch nach Embedding/Enqueue aufgerufen.
+           Kein Timer-Daemon nötig.
     """
 
     # Conservative fixed estimate for external carrier coverage to ensure
@@ -1244,6 +1255,59 @@ class GhostAuditInterceptor:
         auto_flush_completed: int = 5,
         auto_flush_interval: float = 2.0,
     ):
+        """Initialize the GhostAudit interceptor for one carrier database.
+
+        Parameters
+        ----------
+        db_path : str
+            Path to the SQLite database file.
+        carrier_config : CarrierConfig or None
+            Describes which app-table fields carry stego bits.
+            Use ``CarrierConfig.from_config_dict()`` to build from a discovery JSON.
+            ``None`` → legacy ``sys_cache`` mode.
+        secret_key : str or None
+            HMAC key for MAC computation.  If None, generated from OS entropy
+            and stored with DPAPI via ``key_provider``.
+        key_provider : optional
+            Key persistence backend.  Defaults to ``EnvKeyProvider(GHOSTAUDIT_KEY)``
+            on all platforms, ``WinCredKeyProvider`` on Windows.
+        ecc_symbols : int
+            Reed-Solomon parity symbols per channel (default 36).
+        verbose : bool
+            Print diagnostic output.
+        siem_export_path : str or None
+            Path for real-time SIEM export (CEF/JSONL).
+        siem_export_format : str
+            ``"jsonl"`` or ``"cef"``.
+        metronome_interval : int
+            Seconds between periodic SIEM state dumps (0 = disabled).
+        temporal_delay_rows : int
+            Rows to skip before embedding starts on a new payload
+            (temporal OPSEC).
+        target_spread_factor : float
+            Spread embedding over N× the event interval (OPSEC).
+        float_warmup_samples : int
+            Float calibrator warmup rows (0 = disabled).
+        external_state_path : str or None
+            Path for evolve/checkpoint files.  Default: ``<db>.evolve``.
+        force_reinit : bool
+            Re-initialise the engine even if state exists.
+        max_queue_size : int
+            Maximum pending payloads before ``QueueOverflowError``.
+        process_id : int
+            Process ID for multi-process de-sync (0-based, < process_count).
+        process_count : int
+            Total number of processes sharing the same carrier table.
+        metric_registry : MetricRegistry or None
+            Inject ``PrometheusMetricRegistry()`` for Prometheus/OTel metrics.
+            ``None`` → ``NoopMetricRegistry`` (zero overhead).
+        auto_flush_completed : int
+            Flush headers after N completed payloads (default 5).
+            Set high (e.g. 999) to disable size-based auto-flush.
+        auto_flush_interval : float
+            Max seconds since last flush before forced flush (default 2.0).
+            Minimum 0.1.  Set high (e.g. 3600) to disable time-based auto-flush.
+        """
         self.config = carrier_config or v7_default_config()
         self.verbose = verbose
         self._process_id = max(0, process_id)
@@ -1752,10 +1816,17 @@ class GhostAuditInterceptor:
     # ------------------------------------------------------------------ intercept API
 
     def intercept(self, row_id: Any, fields: dict[str, Any]) -> dict[str, Any]:
-        """Compatibility wrapper returning only modified fields.
+        """Embed the next pending stego bits into ``fields``.
 
-        Use ``intercept_result`` when callers need to distinguish passthrough,
-        header rows, unknown rows, and carrier-gating skips.
+        Call this **before** every app UPDATE with the fields the app
+        intends to write.  Returns a modified dict with carrier fields
+        overlaid.  Pass the returned dict to the UPDATE.
+
+        When no bits are pending (idle), returns ``dict(fields)`` unchanged
+        — zero overhead.
+
+        For detailed result metadata (passthrough, header-row, carrier-gating),
+        use ``intercept_result()`` instead.
         """
         return self.intercept_result(row_id, fields).fields
 
@@ -2055,7 +2126,7 @@ class GhostAuditInterceptor:
                 self._delete_payload(completed.seq)
                 self._completed_payloads.append(completed)
                 # payload lifecycle: _payload_queue → _completed_payloads
-                # HOOK: pending_payloads dec follows in flush_headers
+                # HOOK: pending_payloads (dec) follows in flush_headers
                 self._save_scheduler_state()
             else:
                 # Persist progress after every bit-tuple embedding for maximum integrity.
@@ -2068,8 +2139,8 @@ class GhostAuditInterceptor:
             return InterceptResult(result, result != fields, "embedded", row_id)
 
     def try_flush(self) -> int:
-        """Flush completed payloads wenn Size- oder Time-Trigger erreicht.
-        Aufruf an Call-Sites nach Embedding/Enqueue — kein Timer-Daemon nötig."""
+        """Flush completed payloads when size or time trigger fires.
+        Called automatically after embedding/enqueue — no timer thread needed."""
         now = time.monotonic()
         size_trigger = len(self._completed_payloads) >= self._auto_flush_completed
         time_trigger = (self._last_flush_ts > 0 and
@@ -2124,7 +2195,7 @@ class GhostAuditInterceptor:
         finally:
             e._set_sys_cache_write_mode(False, commit=True)
 
-        # HOOK: pending_payloads (dec) — Header erfolgreich geschrieben
+        # HOOK: pending_payloads (dec) — header successfully written
         self._pending_payloads.dec()
 
         if self.verbose:
@@ -2201,11 +2272,13 @@ class GhostAuditInterceptor:
     # ------------------------------------------------------------------ log_event
 
     def log_event(self, event_msg: str, immediate_commit: bool = True) -> int | None:
-        """Log an audit event.
+        """Log a plain-string audit event.
 
         Encodes the event with RS+RAID-6 and enqueues the resulting bits for
         embedding via future ``intercept()`` calls.  Also writes to the V7
         audit_log table so Merkle anchors and checkpoints work normally.
+
+        For structured events (kwargs → JSON), use ``log_structured_event()``.
 
         Returns the sequence number.
         """
@@ -2355,18 +2428,21 @@ class GhostAuditInterceptor:
         )
         self._payload_queue.append(payload)
         self._save_payload(payload)
-        # HOOK: pending_payloads (inc) — neuer Payload im Pipeline-Eingang
+        # HOOK: pending_payloads (inc) — new payload enters the pipeline
         self._pending_payloads.inc()
-        self.try_flush()  # Time-Trigger: Leerlauf nach letztem Flush erkennen
+        self.try_flush()  # Time-trigger: catch idle periods since last flush
 
     # ------------------------------------------------------------------ recovery
 
     def recover_events(self) -> list[tuple[int, str]]:
-        """Recover logged events from the carrier table.
+        """Recover all logged events from the carrier table.
 
-        For the default sys_cache mode, delegates to V7's full recovery path.
-        For external-carrier mode, uses V9's own recovery which reads bits
-        directly from the app table rows in slot order.
+        Returns ``[(seq, message), ...]`` — sorted by sequence number,
+        deduplicated, RS+RAID-6 error-corrected.  Messages are plain strings;
+        if logged via ``log_structured_event()``, decode with ``json.loads()``.
+
+        Call this at app startup AFTER all pending writes are committed.
+        Also triggers ``flush_headers()`` to finalise any in-flight payloads.
         """
         self._ensure_carrier_rows()
         self.flush_headers()
