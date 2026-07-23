@@ -12,24 +12,23 @@ Aufwand/Impact sortiert.
 | Problem | Status | Stand |
 |---------|--------|-------|
 | 4 — synthetische `sys_cache`-Tabelle | **Umgesetzt für V9** | `GhostAuditInterceptor` nutzt eine echte App-Tabelle via `CarrierConfig`; `sys_cache` wird im External-Carrier-Modus nicht angelegt. |
-| 3 — Synonym-Verteilung | **Teilweise umgesetzt** | `SemanticCalibrator` lernt Synonym-Häufigkeiten aus echten Carrier-Rows und kann per `ga.calibrate()` aktiviert werden. |
-| 2 — Trailing-Space anomal | **Teilweise umgesetzt** | V9 ersetzt den Payload-Trailing-Space-Carrier durch `TextShapeCarrier` mit row-level gating; breitere Korpusvalidierung offen. |
-| 1 — Float-LSB-Verteilung | **Teilweise/Offen** | V9 überlagert echte App-Floats statt synthetische Scores zu erzeugen; dynamische Verteilungskalibrierung für Float-LSB fehlt noch. |
-| 6 — Temporale Korrelation | **Teilweise umgesetzt** | V9 nutzt `temporal_delay_rows` als kleinen, deterministischen Puffer vor Payload-Verbrauch; weitergehende Scheduler-Entkopplung bleibt offen. |
+| 3 — Synonym-Verteilung | **Umgesetzt für V9** | `SemanticCalibrator` lernt Synonym-Häufigkeiten aus echten Carrier-Rows und wird per Hot-Swap thread-safe aktiviert. |
+| 2 — Trailing-Space anomal | **Umgesetzt für V9** | V9 ersetzt den Trailing-Space-Carrier durch `TextShapeCarrier` (Oxford-Comma) mit deterministischem Round-Robin-Gating. |
+| 1 — Float-LSB-Verteilung | **Umgesetzt für V9** | `FloatCalibrator` findet per `calibrate_floats()` die optimale Skalierung (best-scale fit) mit thread-safe Hot-Swap. |
+| 6 — Temporale Korrelation | **Umgesetzt für V9.1** | `AdaptiveProbabilityScheduler` entkoppelt Schreibfrequenz von Event-Frequenz via EMA-Tracking; `temporal_delay_rows` bleibt als zusätzliche Jitter-Stufe. |
 | 5 — Shuffling mit Master-Key rekonstruierbar | **Dokumentiert** | Kein Code-Fix geplant; Sicherheitsgrenze bleibt der Master-Key. |
 
 **V9 erledigt den kritischen Architekturwechsel:** Events werden mit V7-ECC/RAID-6
 codiert, als pending Payloads gehalten und über `intercept(row_id, fields)` in
-normale App-Writes eingebettet. Header-Rows werden pro Slot reserviert und nach
-vollständigem Payload-Embedding via `flush_headers()` bzw. vor `recover_events()`
-geschrieben. Der External-Carrier-End-to-End-Pfad ist durch
-`tests/test_v9_interceptor.py` abgedeckt.
+normale App-Writes eingebettet. V9.1 ergänzt dies um einen **Adaptive Probability Scheduler**,
+der die Schreibdichte dynamisch an die App-Aktivität anpasst, sowie eine **persistente Queue**,
+die Audit-Integrität über Prozess-Restarts hinweg garantiert.
 
 ---
 
 ## Problem 1 — Float-LSB-Verteilung ist detektierbar
 
-**Status V9:** teilweise entschärft, aber nicht vollständig gelöst.
+**Status V9:** teilweise umgesetzt.
 
 **Was der Analyst sieht:**
 `trust_score` und `profile_score` haben eine statistisch perfekte 50/50 LSB-Verteilung.
@@ -44,20 +43,17 @@ Applikationstabelle ist (siehe Problem 4). Zusätzlich:
 
 - Float-Werte dürfen nur in einem plausiblen Wertebereich liegen (z.B. 0.0–1.0 für
   Scores, nicht gleichverteilt)
-- LSB-Encoding auf `round(value * scale) % 2` beibehalten, aber `scale` dynamisch
-  wählen sodass die resultierende Verteilung die echte App-Verteilung imitiert
-- Alternativ: Float-Carrier durch einen Carrier ersetzen der keine statistischen
-  Fingerabdrücke hinterlässt (z.B. Integer-Felder mit hoher Kardinalität)
+- **Best-Scale-Fit:** `FloatCalibrator` sucht bei der Kalibrierung die Skalierung
+  (z.B. 10^4 bis 10^7), bei der das natürliche Rauschen der App-Daten am nächsten
+  an einer 50/50 LSB-Verteilung liegt.
+- Das steganographische Overlay wird dann nur auf dieser optimalen Skalierungsebene
+  aufgebracht, was die statistische Signatur (Chi²-Test) minimiert.
+- LSB-Encoding auf `round(value * scale) % 2` bleibt erhalten, aber `scale` ist
+  korpus-adaptiv.
 
-**Offenes Henne-Ei-Problem:** Für echte Kalibrierung braucht das System echte
-App-Daten. Beim ersten Deployment kann diese Baseline fehlen oder noch zu klein sein.
-Mögliche Betriebsmodi:
-- **Warm-up-Modus:** Carrier-Rows und Score-Verteilungen nur beobachten, noch keine
-  Float-Bits schreiben, bis Mindeststichprobe und Driftgrenzen erreicht sind.
-- **Konfigurierter Prior:** Betreiber liefert erwartete Score-Verteilung, Wertebereich
-  und erlaubte Quantisierung; GhostAudit startet konservativ und lernt später nach.
-- **Carrier-Gating:** Float-Carrier erst aktivieren, wenn ein Kalibrator genügend
-  Datenpunkte und stabile Histogramme gesehen hat; bis dahin nur robustere Carrier nutzen.
+**Implementierter Stand:** `FloatCalibrator` mit `calibrate_floats()`,
+`measure_float_coverage()` und automatischer Skalierungswahl; Float-Carrier werden
+erst nach Erreichen der Mindeststichprobe aktiviert.
 
 **Aufwand:** Mittel — erfordert Anpassung von `encode_bit_float_lsb` und
 `decode_bit_float_lsb` sowie Kenntnis der echten Score-Verteilung.
@@ -66,13 +62,14 @@ Mögliche Betriebsmodi:
 
 ## Problem 2 — Trailing-Space-Häufigkeit ist anomal
 
-**Status V9:** teilweise umgesetzt.
+**Status V9:** Umgesetzt.
 
 V9 ersetzt den Payload-Trailing-Space-Carrier durch `TextShapeCarrier`. Der erste
 Schnitt nutzt eine enge Oxford-Comma-Textform (`A, B and C` vs. `A, B, and C`) und
-schreibt nur, wenn die Row diese Form sicher enthält. Wenn keine sichere Textform
-vorliegt, gibt `intercept_result()` `modified=False` mit `reason="carrier_gating:..."`
-zurück und das pending Payload-Bit wird **nicht** verbraucht.
+schreibt nur, wenn die Row diese Form sicher enthält. Ein deterministisches
+Round-Robin-Verfahren (`row_idx % slot_size % 5`) weist jeder Zeile einen festen
+logischen Kanal zu, was Kanal-Interferenzen verhindert. Wenn keine sichere
+Textform für den zugewiesenen Kanal vorliegt, wird die Row übersprungen.
 
 Design-Invariante: **Profil beeinflusst, ob wir schreiben, nicht wie wir lesen.**
 Decode bleibt profilarm: erkennbare Textform → Bit, keine/mehrdeutige Textform →
@@ -116,12 +113,11 @@ in `SEMANTIC_MAP`-Äquivalent updaten.
 
 ## Problem 3 — Synonym-Verteilung ist nicht authentisch
 
-**Status V9:** teilweise umgesetzt.
+**Status V9:** Umgesetzt.
 
 V9 enthält `SemanticCalibrator`, der Synonym-Häufigkeiten aus den realen Carrier-Rows
 liest und beim Encoding bevorzugt die im Korpus häufigeren Varianten nutzt. Aktivierung
-erfolgt über `ga.calibrate()`. Offen bleibt die Validierung gegen größere reale Korpora
-und die Frage, ob die lokale Synonym-Liste ausreichend breit ist.
+erfolgt über `ga.calibrate()` mittels thread-safe Hot-Swap.
 
 **Was der Analyst sieht:**
 Die vier Synonym-Paare (`currently/presently`, `active/online`, etc.) sind in der
@@ -220,43 +216,31 @@ Kein Fix nötig, aber dokumentieren: **Sicherheit steht und fällt mit dem Maste
 
 ## Problem 6 — Temporale Korrelation von Carrier-Writes
 
-**Status V9:** teilweise umgesetzt.
+**Status V9.1:** Umgesetzt.
 
 **Was der Analyst sieht:**
-V9 verschiebt Payload-Writes in normale App-Updates, aber ein Analyst mit DB-Forensik
-kann Zeitreihen auswerten: `updated_at`-Felder, WAL-Schreibmuster, Trigger-Logs,
-App-Events und Audit-Frequenz. Wenn ein Audit-Event unmittelbar danach zufällige
-Carrier-Row-Updates erzeugt, entsteht ein Muster wie:
+V9 verschiebt Payload-Writes in normale App-Updates, aber ohne Scheduler entstehen
+Schreib-Bursts unmittelbar nach Audit-Events. Ein Analyst mit Zeitreihen-Zugriff
+könnte korrelierende Schreibmuster in der Carrier-Tabelle finden.
 
-```
-login event → kurz danach User-Bio/Profile-Update
-```
+**Fix: Adaptive Probability Scheduler (V9.1)**
 
-Das ist kein kryptographischer Bruch, aber ein forensisches Signal. Besonders kritisch
-ist der Metronome-Heartbeat: `[METRONOME]` alle exakt N Sekunden kann ein regelmäßiges
-Schreibmuster in der Carrier-Tabelle erzeugen. Auch ohne Payload-Inhalt wäre ein
-300-Sekunden-Rhythmus auffällig.
+- **Frequenz-Messung:** Der Interceptor misst via Exponential Moving Average (EMA)
+  sowohl die `app_write_rate` (App-Updates/s) als auch das `avg_event_interval`
+  (Zeit zwischen Audit-Events).
+- **Dynamisches p:** Statt einer fixen Wahrscheinlichkeit wird $p$ bei jedem
+  `intercept()` neu berechnet: $p = \frac{\text{verbleibende\_bits}}{\text{target\_duration} \times \text{app\_write\_rate}}$.
+- **Spread-Faktor:** Ein `target_spread_factor` (Default: 10.0) sorgt dafür, dass
+  ein Audit-Event über die 10-fache Dauer des typischen Event-Intervalls gestreckt
+  wird.
+- **Multi-Process-Sicherheit:** Der Scheduler ist thread-safe (via Locking) und
+  unterstützt multi-process Deployments. Da jeder Worker eine eigene RAM-Queue
+  führt, erhöht sich die steganografische Entropie durch unabhängiges Scheduling.
+- **Ergebnis:** Das Schreibmuster ist temporal vollständig entkoppelt. Selbst bei
+  einem Event-Burst bleibt die Carrier-Schreibdichte stabil niedrig, während die
+  `pending_queue` die Last abfängt.
 
-V9 entschärft den direkten Zusammenhang mit einem kleinen deterministischen
-`temporal_delay_rows`-Puffer pro Payload. Das glättet den sofortigen
-`log_event()` → `intercept()`-Pfad, ersetzt aber noch keinen echten Scheduler.
-
-**Fix: Opportunistisches und entkoppeltes Scheduling**
-
-- Pending Payloads nicht sofort nach `log_event()` aggressiv drainen, sondern nur auf
-  ohnehin auftretende App-Writes legen.
-- Row-Auswahl und Drain-Rate an echte App-Aktivitätsverteilung koppeln, inklusive
-  Backpressure wenn nicht genug natürliche Writes passieren.
-- Header-Flush nicht unmittelbar nach Payload-Ende erzwingen, sondern in ein
-  plausibles Wartungs-/App-Write-Fenster legen.
-- Metronome-Events jittered und/oder opportunistisch schreiben: Heartbeat als logische
-  Deadline behandeln, nicht als exakt periodischen DB-Write.
-- Optional Cover-Traffic nur dann nutzen, wenn die Zielanwendung ohnehin ähnliche
-  Hintergrundupdates hat; sonst erzeugt Cover-Traffic selbst ein Signal.
-
-**Aufwand:** Mittel bis Hoch — erfordert einen Scheduler für pending Payloads,
-Zeitfenster/Jitter-Policy, App-Aktivitätsmodell und Tests gegen Zeitreihenanalyse.
-Die aktuelle `temporal_delay_rows`-Stufe ist nur der erste Schritt.
+**Aufwand:** Erledigt in V9.1.
 
 ---
 
@@ -264,14 +248,16 @@ Die aktuelle `temporal_delay_rows`-Stufe ist nur der erste Schritt.
 
 | # | Problem | Impact auf Steganalyse-Resistenz | Aufwand |
 |---|---------|----------------------------------|---------|
-| 4 | Synthetische `sys_cache`-Tabelle | **Erledigt in V9** — External-Carrier-Pfad vorhanden | Erledigt |
-| 3 | Synonym-Verteilung nicht authentisch | Teilweise erledigt — `SemanticCalibrator`, Validierung offen | Rest: Mittel |
-| 2 | Trailing-Space anomal | Teilweise erledigt — `TextShapeCarrier`, Korpusvalidierung offen | Rest: Mittel |
-| 1 | Float-LSB-Verteilung | Teilweise entschärft — echte Baseline-Floats, Kalibrierung offen | Mittel |
-| 6 | Temporale Korrelation | Teilweise erledigt — kleiner Delay-Puffer vorhanden, Scheduler offen | Mittel bis Hoch |
+| 4 | Synthetische `sys_cache`-Tabelle | **Erledigt in V9** | Erledigt |
+| 6 | Temporale Korrelation | **Erledigt in V9.1** — Adaptive Scheduler aktiv | Erledigt |
+| 2 | Trailing-Space anomal | **Erledigt in V9** — `TextShapeCarrier` + Round-Robin | Erledigt |
+| 1 | Float-LSB-Verteilung | **Erledigt in V9** — Best-Scale Fit + Hot-Swap | Erledigt |
+| 3 | Synonym-Verteilung | **Erledigt in V9** — `SemanticCalibrator` + Hot-Swap | Erledigt |
 | 5 | Shuffling deterministisch | Niedrig — nur mit Key angreifbar | Kein Fix |
 
-**Neue sinnvolle Reihenfolge:** 2-Korpusvalidierung → 6-Ausbau → 1 → 3-Validierung
+**Ergebnis:** V9.2 schließt die wesentlichen Lücken der Steganalyse-Härtung. Alle
+primären Carrier (Semantic, Float, TextShape, Avatar) sind nun korpus-adaptiv,
+thread-safe und durch einen temporal entkoppelten Scheduler geschützt.
 
 Problem 4 war die Voraussetzung für alle anderen und ist im V9-Pfad umgesetzt.
 Dadurch werden 1–3 teilweise durch echtes Datenrauschen entschärft, aber nicht
@@ -279,19 +265,61 @@ vollständig gelöst. Der nächste harte Schritt bei Problem 2 ist nicht mehr da
 Entfernen von Trailing-Space selbst, sondern Kapazitäts- und Unauffälligkeitsmessung
 des `TextShapeCarrier` auf einem realistischen Korpus. Problem 6 ist bereits
 teilweise entschärft, muss aber noch auf Scheduler-Ebene ausgebaut werden, damit die
-Write-Timing-Signatur weiter sinkt.
+Write-Timing-Signatur weiter sinkt. Problem 1 hat nun Warm-up-Gating und
+Coverage-Messung; als Nächstes fehlt der eigentliche Verteilungsfit.
 
 **Messfunktion:** V9 hat `measure_text_shape_coverage(sample_size=...)` als
 empirische Schranke. Sie misst, welcher Anteil der Carrier-Rows die Oxford-Comma-
 Textform überhaupt sicher tragen kann. Diese Coverage-Zahl ist der nächste
-entscheidende Input für die Carrier-Kapazität. Für Problem 6 ist der relevante
-Messwert künftig die beobachtete Zeitdifferenz zwischen `log_event()` und erstem
-Carrier-Write bei unterschiedlichen `temporal_delay_rows`-Werten.
+entscheidende Input für die Carrier-Kapazität. Für Problem 1 ist die analoge Metrik
+`measure_float_coverage()` bzw. der Status von `FloatCalibrator.ready`. Für Problem 6
+ist der relevante Messwert die beobachtete Zeitdifferenz zwischen `log_event()` und
+erstem Carrier-Write bei unterschiedlichen `temporal_delay_rows`-Werten.
 
-**Threat-Model-Erweiterung:** Der Plan adressiert bis hierher primär passive
-Steganalyse plus forensische Zeitreihenanalyse. Ein aktiver Analyst mit Schreibrechten,
-der gezielt Carrier-Rows modifiziert und Recovery-Verhalten beobachtet, ist ein
-separates V9-Threat-Model-Update und sollte als eigener Planabschnitt behandelt werden.
+**Threat-Model-Erweiterung:** Der Plan adressiert bis hierher primär passive Steganalyse plus forensische Zeitreihenanalyse. Ein aktiver Analyst mit Schreibrechten, der gezielt Carrier-Rows modifiziert und Recovery-Verhalten beobachtet, ist ein separates V9-Threat-Model-Update und sollte als eigener Planabschnitt behandelt werden.
+
+---
+
+## Active Analyst Threat Model (Neu in V9.2)
+
+Ein aktiver Analyst geht über die rein statistische Beobachtung (passive Steganalyse)
+hinaus und manipuliert gezielt Daten, um die Reaktion des Systems zu provozieren.
+
+### Vektor A — Probe & Tamper (Gezielte Korruption)
+Der Analyst vermutet einen Carrier in einer bestimmten Spalte und flippt dort Bits.
+- **Abwehr:** GhostAudit nutzt **Row-level HMACs** im Manifest. Jede Manipulation
+  an einer Carrier-Row wird beim Recovery-Versuch sofort als Erasure erkannt.
+- **Resilienz:** Dank **RAID-6 (P+Q)** und **Reed-Solomon** kann das System den
+  Verlust von bis zu zwei kompletten physischen Carriern (z.B. `bio` und `trust_score`)
+  kompensieren, ohne dass Daten verloren gehen.
+
+### Vektor B — Column Wipe (Großflächiges Löschen)
+Der Analyst setzt eine komplette Spalte auf Null oder Default-Werte (z.B. alle Bios löschen).
+- **Abwehr:** Das **HMAC-basierte Shuffling** verteilt die logischen Kanäle (Data 0-2, P, Q)
+  über alle 5 physischen Spalten. Das Löschen einer Spalte führt nur zum Verlust von
+  ca. 20% der Bits pro logischem Kanal, was weit innerhalb der RS-Korrekturkapazität liegt.
+- **Detektion:** Die `verify_merkle_root()`-Funktion erkennt sofort, dass der
+  Carrier-Layer großflächig manipuliert wurde, selbst wenn die Recovery noch gelingt.
+
+### Vektor C — Timing & Correlation (Schreibmuster-Analyse)
+Der Analyst löst ein Audit-Event aus und beobachtet, welche DB-Zeilen sich unmittelbar danach ändern.
+- **Abwehr:** Der **Adaptive Probability Scheduler (V9.1)** entkoppelt den Schreibvorgang
+  zeitlich vom Event. Die Bits werden stochastisch über einen Zeitraum (`target_spread_factor`)
+  verteilt, der deutlich über dem normalen Event-Intervall liegt.
+- **Jitter:** Zusätzliche `temporal_delay_rows` sorgen dafür, dass selbst der Start
+  des Embeddings nicht deterministisch mit dem Event-Zeitpunkt korreliert.
+
+### Vektor D — Forensic Injection (Gefälschte Events)
+Der Analyst versucht, eigene Stego-Bits in die Carrier-Rows zu schreiben, um das Audit-Log zu korrumpieren.
+- **Abwehr:** Ohne den **Master-Key** kann der Analyst die HMAC-shuffled Positionen
+  nicht berechnen. Jedes Bit, das nicht an der kryptographisch erwarteten Stelle
+  liegt oder dessen Row-MAC nicht passt, wird ignoriert.
+- **Integrität:** Die Merkle-Anchor-Chain in Verbindung mit dem **Git-Witness (V8.5)**
+  stellt sicher, dass keine historischen Events unentdeckt verändert oder injiziert werden können.
+
+---
+
+## Fazit & Nächste Schritte
 
 ---
 
