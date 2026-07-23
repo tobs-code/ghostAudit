@@ -1,6 +1,13 @@
 """Tests für das MetricRegistry-Interface."""
 
+import os
+import tempfile
+import time
+
+from unittest.mock import MagicMock
+
 from core.metrics import NoopMetricRegistry
+from core.ghost_audit_v9 import GhostAuditInterceptor
 
 
 def test_noop_registry_zero_cost():
@@ -28,9 +35,6 @@ def test_noop_registry_zero_cost():
 
 def test_noop_default_in_interceptor():
     """GhostAuditInterceptor nutzt NoopMetricRegistry wenn keins übergeben."""
-    import tempfile
-    import os
-    from core.ghost_audit_v9 import GhostAuditInterceptor
 
     tmp = tempfile.mkdtemp()
     db_path = os.path.join(tmp, "test.db")
@@ -46,6 +50,48 @@ def test_noop_default_in_interceptor():
         ga._pending_payloads.inc()
         ga._pending_payloads.dec()
         ga._pending_payloads.set(0)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_try_flush_size_trigger():
+    """try_flush flusht wenn auto_flush_completed erreicht."""
+    tmp = tempfile.mkdtemp()
+    db_path = os.path.join(tmp, "test.db")
+    try:
+        ga = GhostAuditInterceptor(db_path, verbose=False,
+                                   auto_flush_completed=3)
+        ga.flush_headers = MagicMock(return_value=1)  # type: ignore[method-assign]
+        assert ga.try_flush() == 0  # leere Queue, kein Trigger
+        ga._completed_payloads.append("p1")
+        assert ga.try_flush() == 0  # 1/3, unter Schwelle
+        ga._completed_payloads.append("p2")
+        assert ga.try_flush() == 0  # 2/3, unter Schwelle
+        ga._completed_payloads.append("p3")
+        result = ga.try_flush()
+        assert result > 0           # 3/3, Size-Trigger feuert
+        ga.flush_headers.assert_called_once()
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_try_flush_time_trigger():
+    """try_flush flusht wenn auto_flush_interval abgelaufen."""
+    tmp = tempfile.mkdtemp()
+    db_path = os.path.join(tmp, "test.db")
+    try:
+        ga = GhostAuditInterceptor(db_path, verbose=False,
+                                   auto_flush_interval=0.1,
+                                   auto_flush_completed=999)
+        ga.flush_headers = MagicMock(return_value=2)  # type: ignore[method-assign]
+        assert ga.try_flush() == 0  # _last_flush_ts == 0, kein Trigger
+        ga._last_flush_ts = time.monotonic() - 0.2   # simuliere abgelaufenes Intervall
+        ga._completed_payloads.append("p1")
+        result = ga.try_flush()
+        assert result > 0           # Time-Trigger feuert
+        ga.flush_headers.assert_called_once()
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)

@@ -1241,6 +1241,8 @@ class GhostAuditInterceptor:
         process_id: int = 0,
         process_count: int = 1,
         metric_registry: "MetricRegistry | None" = None,
+        auto_flush_completed: int = 5,
+        auto_flush_interval: float = 2.0,
     ):
         self.config = carrier_config or v7_default_config()
         self.verbose = verbose
@@ -1248,6 +1250,9 @@ class GhostAuditInterceptor:
         self._process_count = max(1, process_count)
         self._target_spread_factor = target_spread_factor
         self.max_queue_size = max(1, max_queue_size)
+        self._auto_flush_completed = max(1, auto_flush_completed)
+        self._auto_flush_interval = max(0.1, auto_flush_interval)
+        self._last_flush_ts = 0.0
         
         # Scheduler state
         self._app_write_rate_ema = 0.0      # app writes per second
@@ -2058,13 +2063,31 @@ class GhostAuditInterceptor:
                 # survive process crashes with zero bit loss.
                 self._save_payload(payload)
 
+            self.try_flush()  # Size-Trigger: completed payloads sammeln
+
             return InterceptResult(result, result != fields, "embedded", row_id)
 
-    def flush_headers(self) -> None:
-        """Write headers for payloads whose bits have fully been embedded."""
+    def try_flush(self) -> int:
+        """Flush completed payloads wenn Size- oder Time-Trigger erreicht.
+        Aufruf an Call-Sites nach Embedding/Enqueue — kein Timer-Daemon nötig."""
+        now = time.monotonic()
+        size_trigger = len(self._completed_payloads) >= self._auto_flush_completed
+        time_trigger = (self._last_flush_ts > 0 and
+                        (now - self._last_flush_ts) >= self._auto_flush_interval)
+        if not (size_trigger or time_trigger):
+            return 0
+        return self.flush_headers()
+
+    def flush_headers(self) -> int:
+        """Write headers for payloads whose bits have fully been embedded.
+        Returns the number of payloads flushed."""
+        flushed = 0
         with self._lock:
             while self._completed_payloads:
                 self._flush_slot_header(self._completed_payloads.pop(0))
+                flushed += 1
+        self._last_flush_ts = time.monotonic()
+        return flushed
 
     def _flush_slot_header(self, payload: "_PendingPayload") -> None:
         """Write the slot header for a completed payload to the carrier table.
@@ -2319,6 +2342,7 @@ class GhostAuditInterceptor:
         self._save_payload(payload)
         # HOOK: pending_payloads (inc) — neuer Payload im Pipeline-Eingang
         self._pending_payloads.inc()
+        self.try_flush()  # Time-Trigger: Leerlauf nach letztem Flush erkennen
 
     # ------------------------------------------------------------------ recovery
 
