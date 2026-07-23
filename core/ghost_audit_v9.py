@@ -1240,6 +1240,7 @@ class GhostAuditInterceptor:
         max_queue_size: int = 100,
         process_id: int = 0,
         process_count: int = 1,
+        metric_registry: "MetricRegistry | None" = None,
     ):
         self.config = carrier_config or v7_default_config()
         self.verbose = verbose
@@ -1324,6 +1325,25 @@ class GhostAuditInterceptor:
             self._save_scheduler_state()
 
         self._resolve_channels()
+
+        # Metric-Interface initialisieren
+        from core.metrics import NoopMetricRegistry
+        metrics = metric_registry or NoopMetricRegistry()
+        self._erasure_total = metrics.counter(
+            "carrier_erasure_total",
+            "MAC verification failures per carrier field",
+            labels=["channel"],
+        )
+        self._recovery_total = metrics.counter(
+            "recovery_total",
+            "RAID-6 recovery events by status",
+            labels=["status"],
+        )
+        self._pending_payloads = metrics.gauge(
+            "pending_payloads",
+            "Number of payloads currently in the pipeline (embedded + pending flush)",
+            labels=[],
+        )
 
         self._witness = TimestampWitness(
             db_path=db_path,
@@ -1712,6 +1732,18 @@ class GhostAuditInterceptor:
                 pass
         return None
 
+    def _field_name_for_channel(self, logical_channel: int) -> str:
+        """Feldname für einen logischen Kanal (0-4) aus der Config."""
+        cfg = self.config
+        ch_map = {
+            0: cfg.integer_channel_field or cfg.semantic_field,
+            1: cfg.float_a_field,
+            2: cfg.timestamp_field or cfg.semantic_field,
+            3: cfg.float_b_field,
+            4: cfg.tilde_field,
+        }
+        return ch_map.get(logical_channel, "unknown")
+
     # ------------------------------------------------------------------ intercept API
 
     def intercept(self, row_id: Any, fields: dict[str, Any]) -> dict[str, Any]:
@@ -1756,6 +1788,15 @@ class GhostAuditInterceptor:
 
             if pending == expected_mac:
                 return True
+
+            # HOOK: erasure_total → label: channel=<field name>
+            # Channel-Name aus config ableiten (erster betroffener Carrier)
+            erasure_ch = (
+                f"semantic/{cfg.semantic_field}" if fields_written.get(cfg.semantic_field, "") != "" else
+                cfg.float_a_field if fields_written.get(cfg.float_a_field, 0.0) != 0.0 else
+                cfg.float_b_field
+            )
+            self._erasure_total.inc(channel=str(erasure_ch) if erasure_ch else "unknown")
 
             logger = __import__("logging").getLogger(__name__)
             logger.warning(
@@ -2008,6 +2049,8 @@ class GhostAuditInterceptor:
                 completed = self._payload_queue.pop(0)
                 self._delete_payload(completed.seq)
                 self._completed_payloads.append(completed)
+                # payload lifecycle: _payload_queue → _completed_payloads
+                # HOOK: pending_payloads dec follows in flush_headers
                 self._save_scheduler_state()
             else:
                 # Persist progress after every bit-tuple embedding for maximum integrity.
@@ -2057,6 +2100,9 @@ class GhostAuditInterceptor:
             e.conn.commit()
         finally:
             e._set_sys_cache_write_mode(False, commit=True)
+
+        # HOOK: pending_payloads (dec) — Header erfolgreich geschrieben
+        self._pending_payloads.dec()
 
         if self.verbose:
             print(
@@ -2271,6 +2317,8 @@ class GhostAuditInterceptor:
         )
         self._payload_queue.append(payload)
         self._save_payload(payload)
+        # HOOK: pending_payloads (inc) — neuer Payload im Pipeline-Eingang
+        self._pending_payloads.inc()
 
     # ------------------------------------------------------------------ recovery
 
@@ -2423,15 +2471,17 @@ class GhostAuditInterceptor:
                 # Verify Row-MAC before extracting bits (Vector A resilience)
                 # If tampering is detected, we skip the row, which turns the error
                 # into an erasure for the RS decoder.
+                row_idx = self._row_id_index.get(rid, 0)
+                target_channel = (row_idx % cfg.slot_size) % 5
+
                 if not e._verify_sys_cache_row(rid, bio, fa, profile_score=fb, avatar_url=til,
                                                timestamp_value=ts_val,
                                                integer_channel_value=iv_val):
                     if self.verbose:
                         print(f"[V9 DEBUG] Row MAC failed for rid={rid} - turning into erasure")
+                    # HOOK: erasure_total — Row-MAC-Fehler während Recovery
+                    self._erasure_total.inc(channel=self._field_name_for_channel(target_channel))
                     continue
-
-                row_idx = self._row_id_index.get(rid, 0)
-                target_channel = (row_idx % cfg.slot_size) % 5
                 
                 # Check eligibility for this channel
                 mapping = e._get_row_carrier_mapping(rid)
@@ -2591,6 +2641,11 @@ class GhostAuditInterceptor:
             logs.append((seq, event_msg))
 
         logs.sort(key=lambda x: x[0])
+        # HOOK: recovery_total — Ergebnis der gesamten Recovery-Operation
+        if logs:
+            self._recovery_total.inc(1.0, status="success")
+        else:
+            self._recovery_total.inc(1.0, status="fail")
         return logs
 
     # ------------------------------------------------------------------ V7 pass-through

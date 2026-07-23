@@ -16,6 +16,13 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Confidence-Schwellenwerte (Score 0-100):
+#   >= 80 → EMPFOHLEN  (sicherer Carrier, App schreibt selten/nie)
+#   50-79 → MÖGLICH    (funktioniert, aber Risiko durch App-Writes)
+#   < 50  → NICHT EMPF (zu hohes Carrier-Kill-Risiko)
+
+DISCOVERY_SCHEMA_VERSION = "9.10"
+
 
 @dataclass
 class ColumnInfo:
@@ -44,15 +51,18 @@ class DiscoveryResult:
     columns: list[ColumnInfo]
     suggestions: list[CarrierSuggestion]
     warnings: list[str] = field(default_factory=list)
+    schema_version: str = DISCOVERY_SCHEMA_VERSION
 
     @property
     def suggested_config(self) -> dict[str, str]:
-        """Beste Vorschläge als flaches dict (role → field)."""
+        """Beste Vorschläge als flaches dict (role → field, inkl. schema_version)."""
         best: dict[str, CarrierSuggestion] = {}
         for s in self.suggestions:
             if s.role not in best or s.score > best[s.role].score:
                 best[s.role] = s
-        return {s.role: s.field for s in best.values()}
+        result = {s.role: s.field for s in best.values()}
+        result["schema_version"] = self.schema_version
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +217,38 @@ def discover_carrier(db_path: str, table: str) -> DiscoveryResult:
     return DiscoveryResult(table, columns, suggestions, warnings)
 
 
+def _score_label(score: int) -> str:
+    if score >= 80:
+        return "EMPFOHLEN"
+    if score >= 50:
+        return "MÖGLICH"
+    return "NICHT EMPF"
+
+
 def print_discovery_report(result: DiscoveryResult) -> None:
     """Gibt den Discovery-Report formatiert auf stdout aus."""
     print(f"\n=== Carrier-Discovery: {result.table} ===")
+    print(f"  Schema-Version: {result.schema_version}")
     print(f"\nSchema ({len(result.columns)} Spalten):")
     for col in result.columns:
         pk = " PK" if col.pk else ""
         nn = " NOT NULL" if col.notnull else ""
         dflt = f" DEFAULT {col.dflt_value}" if col.dflt_value else ""
         print(f"  {col.name:20s}  {col.type:10s}{pk}{nn}{dflt}")
+
+    if result.suggestions:
+        print(f"\nVorschläge ({len(result.suggestions)}):")
+        print(f"  {'Feld':20s}  {'Rolle':25s}  {'Score':6s}  {'Bewertung':15s}  {'Begründung'}")
+        print(f"  {'-'*20}  {'-'*25}  {'-'*6}  {'-'*15}  {'-'*30}")
+        for s in sorted(result.suggestions, key=lambda x: -x.score):
+            label = _score_label(s.score)
+            print(f"  {s.field:20s}  {s.role:25s}  {s.score:3d}    {label:15s}  {s.reason}")
+
+        score_dist = {"EMPFOHLEN": 0, "MÖGLICH": 0, "NICHT EMPF": 0}
+        for s in result.suggestions:
+            score_dist[_score_label(s.score)] += 1
+        print(f"\n  Score-Verteilung: {score_dist['EMPFOHLEN']}× EMPFOHLEN, "
+              f"{score_dist['MÖGLICH']}× MÖGLICH, {score_dist['NICHT EMPF']}× NICHT EMPF")
 
     config = result.suggested_config
     if config:
@@ -227,24 +260,20 @@ def print_discovery_report(result: DiscoveryResult) -> None:
 
         print(f"\nPython-Code:")
         print(f"  from core.carrier_config import CarrierConfig")
-        fields = ",\n        ".join(f'{role.replace("field", "field")}="{val}"'
-                                     if val != "— nicht gefunden —" else f"#{role} leer lassen"
-                                     for role, val in config.items())
-        print(f"  cfg = CarrierConfig(")
-        print(f"      table=\"{result.table}\",")
         for role in ["id_field", "integer_channel_field", "float_a_field",
                      "float_b_field", "timestamp_field", "tilde_field", "semantic_field"]:
             val = config.get(role)
             if val:
-                print(f"      {role}={val!r},")
-        print(f"  )")
+                print(f"  cfg = CarrierConfig(table={result.table!r}, {role}={val!r})")
+                break
 
     if result.warnings:
         print(f"\nWarnungen ({len(result.warnings)}):")
         for w in result.warnings:
             print(f"  ⚠ {w}")
 
-    print(f"\n{len(result.suggestions)} Vorschläge, {len(result.warnings)} Warnungen\n")
+    print(f"\n{len(result.suggestions)} Vorschläge, {len(result.warnings)} Warnungen")
+    print(f"Confidence-Schwellenwerte: >=80 EMPFOHLEN  50-79 MÖGLICH  <50 NICHT EMPF\n")
 
 
 # ---------------------------------------------------------------------------

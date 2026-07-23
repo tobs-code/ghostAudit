@@ -795,6 +795,7 @@ core/
 ├── ghost_audit_v9.py          Interceptor-Architektur mit echtem App-Carrier
 ├── carrier_config.py          Konfiguration für Carrier-Tabelle und Felder
 ├── discovery.py               Carrier-Discovery (PRAGMA-basiert, CLI+API)
+├── metrics.py                 MetricRegistry-Interface + Noop + Prometheus-Impl
 ├── ghost_audit_v7.py          Engine und Legacy-sys_cache-Modus (V7–V8.x)
 ├── ecc_layer.py               Reed-Solomon Utilities
 ├── key_provider.py            DPAPI / EnvKeyProvider
@@ -805,6 +806,7 @@ core/
 tests/
 ├── test_v9_interceptor.py     V9 Hook, echter Carrier, External-Carrier-Recovery
 ├── test_discovery.py          Carrier-Discovery (PRAGMA, Pattern-Matching, Warnungen)
+├── test_metrics.py            Metric-Interface (Noop-Registry + Interceptor-Integration)
 ├── quickstart_tests.py        Interaktives Testmenü
 ├── master_test_suite_v7.py    Orchestrator, erzeugt JSON-Report
 ├── attack_simulator_v8.py     5 Angriffsvektoren (MITRE ATT&CK)
