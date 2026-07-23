@@ -50,6 +50,7 @@ from typing import Any, NamedTuple
 
 from core.carrier_config import CarrierConfig, v7_default_config
 from core.ghost_audit_v7 import GhostAuditV7, StegoEngine
+from core.timestamp_witness import TimestampWitness
 from reedsolo import RSCodec, ReedSolomonError
 
 
@@ -1008,6 +1009,8 @@ class GhostAuditInterceptor:
         self._restarted = True
         self._lock = threading.RLock()
         self._carrier_schema_version = 1
+        root, _ = os.path.splitext(db_path)
+        self._evolve_path = external_state_path or (root + ".evolve")
 
         # Load persisted state
         self._load_scheduler_state()
@@ -1022,6 +1025,12 @@ class GhostAuditInterceptor:
             self._engine._rebuild_sys_cache_manifest()
             self._carrier_schema_version = 2
             self._save_scheduler_state()
+
+        self._witness = TimestampWitness(
+            conn=self._engine.conn,
+            evolve_path=self._evolve_path,
+            poll_interval=30.0,
+        )
 
         # For external carrier: populate _orig_ids from real table rows
         if is_external:
@@ -1744,6 +1753,14 @@ class GhostAuditInterceptor:
 
             seqs = self._engine.log_events(event_msgs, immediate_commit=immediate_commit)
 
+            if immediate_commit and seqs and self._evolve_path:
+                try:
+                    last_seq = seqs[-1]
+                    self._witness.add_pending(last_seq, self._evolve_path)
+                except Exception:
+                    if self.verbose:
+                        print("[V9] Witness add_pending failed (non-fatal)")
+
             for msg in event_msgs:
                 self._enqueue_event_bits(msg)
 
@@ -2134,7 +2151,12 @@ class GhostAuditInterceptor:
         return self._engine.verify_all_event_macs()
 
     def export_checkpoint(self, path: str | None = None) -> dict:
-        return self._engine.export_checkpoint(path)
+        cp = self._engine.export_checkpoint(path)
+        cp["witness"] = self.get_witness_status()
+        return cp
+
+    def get_witness_status(self) -> dict:
+        return self._witness.get_status()
 
     def verify_checkpoint(self, checkpoint, path: str | None = None) -> dict:
         return self._engine.verify_checkpoint(checkpoint, path)
@@ -2149,4 +2171,5 @@ class GhostAuditInterceptor:
         return self._engine.list_merkle_anchors(limit)
 
     def close(self):
+        self._witness.stop(timeout=5.0)
         self._engine.close()

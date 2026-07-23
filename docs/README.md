@@ -38,8 +38,7 @@ events = ga.recover_events()   # → [( 1, "user=alice action=login ip=10.0.0.1"
 **How it works:** Events are encoded into synonym choices in bio text, LSBs of float score columns, timestamp-LSB of a write-once datetime column, and URL tilde suffixes — spread across 5 logical channels with RAID-6 erasure coding and Reed-Solomon ECC. An attacker who doesn't know the master key cannot find, read, or undetectably modify the logs.
 
 ```
-pip install reedsolo cryptography numpy
-python quickstart.py   # see it in action
+pip install reedsolo cryptography numpy rfc3161ng requests
 ```
 
 See [quickstart.py](../quickstart.py) for the legacy standalone demo including attack simulation and recovery.
@@ -139,13 +138,14 @@ SQLite-Datenbank
     │       └── Jede Zeile kodiert alle 5 logischen Streams gleichzeitig (V8 Multiplexing)
     │           {Data0, Data1, Data2, P-Parity, Q-Parity} via HMAC-Permutation auf 5 Carrier
     │
-    ├── sys_cache_manifest    ← Row-MACs (5×8 Byte pro Zeile)
-    ├── sys_cache_pending_queue ← Persistente ECC-Bits (V9.1)
+    ├── sys_cache_manifest        ← Row-MACs (5×8 Byte pro Zeile)
+    ├── sys_cache_pending_queue   ← Persistente ECC-Bits (V9.1)
     ├── sys_cache_scheduler_state ← Persistente EMA-Raten (V9.1)
-    ├── sys_channel_quality   ← EMA-Degradationshistorie pro Kanal
-    ├── merkle_anchor        ← kryptographische Slot-Fingerabdrücke
-    ├── event_mac_tags       ← per-Event HMAC-Tags
-    └── fs_key_state         ← Forward-Secrecy evolve_count
+    ├── sys_channel_quality       ← EMA-Degradationshistorie pro Kanal
+    ├── sys_witness_queue         ← TSA-Witness pending Entries (V9.4)
+    ├── merkle_anchor            ← kryptographische Slot-Fingerabdrücke
+    ├── event_mac_tags           ← per-Event HMAC-Tags
+    └── fs_key_state             ← Forward-Secrecy evolve_count
 ```
 
 Im V7/V8-Kompatibilitätsmodus heißt die Carrier-Tabelle weiterhin `sys_cache`.
@@ -213,6 +213,7 @@ Von innen nach außen:
 | 9 | **Merkle-Root** | HMAC-SHA256-Baum über alle 5 Slots. Erkennt jede nachträgliche Manipulation. |
 | 10 | **Forward Secrecy (Anchor-Keys)** | `k_write_merkle` evolviert nach jedem Event via HMAC. Alter Key wird überschrieben. |
 | 11 | **Proactive Self-Healing** | Degradierte Slots werden im Hintergrund mit erhöhten ECC-Parametern neu geschrieben. |
+| 12 | **TSA Witness (V9.4)** | `.evolve`-Digest wird via RFC 3161 an Public Time-Stamp Authority gesubmitted (Background-Thread, asynchron). Der signierte Timestamp-Token (TST) beweist die Existenz des Checkpoints zu einem bestimmten Zeitpunkt — Both-Snapshot-Angriff wird zum Both-Snapshot-AND-TSA-Compromise. |
 
 ---
 
@@ -231,6 +232,7 @@ Von innen nach außen:
 - `carrier_schema_version` in `sys_cache_scheduler_state` migriert automatisch von V1 (kein Timestamp) zu V2 (Timestamp) beim ersten Start mit `timestamp_field`
 - `_parse_timestamp_to_int`: Typ-sicheres Parsen von INTEGER (ms), REAL (Sekunden vs. ms via `<1e11`-Heuristik) und TEXT (ISO-8601 mit Z)
 - **V9.1+:** Adaptive Probability Scheduler, persistente Queue, Reject-New Overflow-Schutz und Thread-Safety.
+- **V9.4 — Timestamp Witness (RFC 3161 TSA):** Background-Thread submitte SHA256(.evolve)-Digest an Public Time-Stamp Authority. Der signierte Timestamp-Token (TST) beweist, dass der `.evolve`-State zu einem bestimmten Zeitpunkt existierte — der Angreifer müsste DB, `.evolve` *und* den TSA-Log gleichzeitig snapshotten. Im Fehlerfall (TSA down) bleibt die Entry `pending` und wird im nächsten Poll-Zyklus erneut versucht. Der Write-Pfad blockiert nie.
 
 ### V8 — Multiplexing & RAID-6
 
@@ -372,6 +374,22 @@ result = ga.verify_checkpoint(cp)
 # result["details"]            → "OK" oder Fehlerbeschreibung
 ```
 
+**TSA-Witness (V9.4):** Seit V9.4 wird der `.evolve`-Digest automatisch nach jedem `log_event(immediate_commit=True)` an eine RFC 3161 Time-Stamp Authority gesubmitted (Best-Effort Background-Thread, pollt alle 30s). Der signierte Timestamp-Token wird in `sys_witness_queue` persistiert. `export_checkpoint()` hängt den Witness-Status ans Checkpoint-Dict an:
+
+```python
+cp = ga.export_checkpoint()
+# cp enthälält zusätzlich:
+# cp["witness"] = {
+#     "evolve_path": "app.evolve",
+#     "pending_count": 0,
+#     "total_entries": 42,
+#     "recent": [{"seq": 42, "state": "confirmed", "tsa_url": "https://freetsa.org/tsr", "confirmed_at": 1763845211000}, ...],
+#     "thread_alive": True
+# }
+```
+
+Ein Both-Snapshot-Angriff müsste jetzt neben DB und `.evolve` auch den TSA-Log kompromittieren — praktisch nicht realisierbar für einen Angreifer ohne Netzwerk-Kontrolle.
+
 **Warum kein vollständiger Event-Level Merkle-Tree?**
 Ein Inclusion Proof (O(log n) Sibling-Hashes pro Event) wäre nur dann stärker, wenn der Root-Hash extern gesichert ist — was der Checkpoint bereits leistet. Der vollständige Umbau würde Komplexität hinzufügen ohne zusätzlichen Schutz im GhostAudit-Threat-Model: Ein privilegierter Angreifer, der die DB kontrolliert, kann einen neuen konsistenten Tree berechnen. Der externe Checkpoint ist die eigentliche Vertrauensgrenze.
 
@@ -460,13 +478,15 @@ $env:GHOST_AUDIT_REBUILD_INTERVAL="25"
 $env:GHOST_AUDIT_EXTERNAL_STATE="E:\secure_mount\audit.evolve"
 ```
 
-**Checkpoint-Workflow (Git als Witness):**
+**TSA-Witness (V9.4, ersetzt Git-Witness):**
 
-Ab V8.6 ist Git-Witness als Standard implementiert. Wenn sich die `*.evolve`-Datei (Rollback-Schutz) innerhalb eines Git-Repositories befindet, führt GhostAudit nach jedem internen State-Update automatisch einen `git add` und `git commit` durch.
+Seit V9.4 ist der **TSA-Witness** der primäre externe Zeuge. Der lokale Git-Witness aus V8.6 wird davon abgelöst: Der Background-Thread in `TimestampWitness` submitte SHA256(.evolve)-Digests an eine RFC 3161 Time-Stamp Authority (TSA) und persistiert die signierten Timestamp-Token in `sys_witness_queue`. Der Write-Pfad blockiert nie — bei TSA-Ausfall bleiben Entries `pending` und werden beim nächsten Poll-Zyklus nachgeholt.
 
-```bash
-# Git-Witness funktioniert jetzt automatisch, solange
-# sich die *.evolve-Datei in einem Git-Repo befindet.
+```python
+# Witness-Status abfragen:
+status = ga.get_witness_status()
+# → {"evolve_path": "app.evolve", "pending_count": 0,
+#     "recent": [...], "thread_alive": True}
 ```
 
 ---
@@ -600,6 +620,22 @@ result = ga.verify_checkpoint(None, path="checkpoint.json")  # aus Datei
 ```python
 ga.export_recovered_logs("out.jsonl", format="jsonl")
 ga.export_recovered_logs("out.cef",   format="cef")
+
+### Witness-Status (V9.4)
+
+```python
+status = ga.get_witness_status()
+# status = {
+#     "evolve_path": "app.evolve",
+#     "pending_count": 0,                # noch nicht an TSA gesendet
+#     "total_entries": 42,
+#     "recent": [
+#         {"seq": 42, "state": "confirmed", "tsa_url": "...", "confirmed_at": ...},
+#         {"seq": 41, "state": "pending", "tsa_url": "", "confirmed_at": 0},
+#     ],
+#     "thread_alive": True,
+# }
+```
 ```
 
 ---
@@ -688,7 +724,7 @@ python tests/benchmark_throughput_v8.py
 - ORM-Textnormalisierung (TRIM, lowercase, synonym-flatten) zerstört bio-basierte Carrier. Bio-SPOF Fix (V9.3) eliminiert Ch2 via Timestamp-LSB → nur noch **1/5 Carrier** betroffen (Ch0).
 - RAID-6 toleriert **beliebige** 2/5 Carrier-Kill. Bei 3/5 ist keine Recovery möglich.
 - Forward Security schützt Slots voneinander, nicht vor Verlust des Master-Keys.
-- Rollback-Schutz hat eine dokumentierte Grenze: Werden DB und `.evolve`-Datei gemeinsam aus demselben Snapshot wiederhergestellt, wird kein Rollback erkannt.
+- Rollback-Schutz hatte eine dokumentierte Grenze: Werden DB und `.evolve`-Datei gemeinsam aus demselben Snapshot wiederhergestellt, wurde kein Rollback erkannt. **Seit V9.4 ist diese Lücke durch den TSA-Witness geschlossen** — der `.evolve`-Digest ist in einem Public Append-Only Log signiert. Ein Both-Snapshot müsste zusätzlich den TSA-Log kompromittieren.
 - `audit_archive` ist absichtlicher Köder — echte Recovery kommt aus der Carrier-Tabelle (`users` in V9, `sys_cache` im Legacy-Modus).
 
 ---
@@ -702,6 +738,7 @@ core/
 ├── ghost_audit_v7.py          Engine und Legacy-sys_cache-Modus (V7–V8.x)
 ├── ecc_layer.py               Reed-Solomon Utilities
 ├── key_provider.py            DPAPI / EnvKeyProvider
+├── timestamp_witness.py       RFC 3161 TSA-Witness (V9.4)
 ├── worker_erasure.py          Erasure-Recovery
 └── security_suite_support.py  Factory, CLI-Flags, Test-Gate-Bypass
 
