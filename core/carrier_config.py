@@ -15,14 +15,15 @@ Each physical carrier maps to one field and one encoding method.
 The logical-to-physical channel assignment is shuffled per-row via HMAC
 (same as V7), so this config only describes the *physical* layer.
 
-  slot 0  semantic      text field  — synonym switching
-  slot 1  float_lsb_a   float field — LSB ±1 encoding
-  slot 2  trailing_space text field — trailing space (same field as semantic)
-  slot 3  float_lsb_b   float field — LSB ±1 encoding (independent column)
-  slot 4  tilde          text field  — tilde suffix (~)
+  slot 0  semantic      text field     — synonym switching
+  slot 1  float_lsb_a   float field    — LSB ±1 encoding
+  slot 2  timestamp_lsb timestamp field — LSB on Unix-ms (INTEGER) or parsed ISO-8601
+  slot 3  float_lsb_b   float field    — LSB ±1 encoding (independent column)
+  slot 4  tilde          text field     — tilde suffix (~)
 
-The text field for semantic and trailing_space is typically the same
-column (e.g. "bio") — both encodings are applied in sequence.
+Semantic (slot 0) and timestamp (slot 2) can live on different columns,
+eliminating the shared-field SPOF that existed when both carriers shared
+a single text column.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ class CarrierConfig:
     float_a_field: str
     float_b_field: str
     tilde_field: str
+    timestamp_field: str = ""
     float_a_range: tuple = (0.0, 1.0)
     float_b_range: tuple = (0.0, 1.0)
     slot_size: int = 1600
@@ -117,6 +119,7 @@ class CarrierConfig:
             self.float_a_field,
             self.float_b_field,
             self.tilde_field,
+            self.timestamp_field,
         ]:
             if f not in seen:
                 seen[f] = True
@@ -137,6 +140,7 @@ def v7_default_config() -> CarrierConfig:
         float_a_field="trust_score",
         float_b_field="profile_score",
         tilde_field="avatar_url",
+        timestamp_field="",
         float_a_range=(0.0, 1.0),
         float_b_range=(0.0, 1.0),
         slot_size=1600,

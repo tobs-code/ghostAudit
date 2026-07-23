@@ -16,6 +16,7 @@ carrier = CarrierConfig(
     float_a_field="trust_score",
     float_b_field="profile_score",
     tilde_field="avatar_url",
+    timestamp_field="created_at",   # V9.3: Ch2 Timestamp-LSB (kein Bio-SPOF)
 )
 
 ga = GhostAuditInterceptor(
@@ -34,7 +35,7 @@ fields = ga.intercept(row_id=user_id, fields=fields)
 events = ga.recover_events()   # → [( 1, "user=alice action=login ip=10.0.0.1")]
 ```
 
-**How it works:** Events are encoded into synonym choices in bio text, LSBs of float score columns, opportunistic text-shape variants, and URL tilde suffixes — spread across 5 logical channels with RAID-6 erasure coding and Reed-Solomon ECC. An attacker who doesn't know the master key cannot find, read, or undetectably modify the logs.
+**How it works:** Events are encoded into synonym choices in bio text, LSBs of float score columns, timestamp-LSB of a write-once datetime column, and URL tilde suffixes — spread across 5 logical channels with RAID-6 erasure coding and Reed-Solomon ECC. An attacker who doesn't know the master key cannot find, read, or undetectably modify the logs.
 
 ```
 pip install reedsolo cryptography numpy
@@ -88,6 +89,7 @@ carrier = CarrierConfig(
     float_a_field="trust_score",
     float_b_field="profile_score",
     tilde_field="avatar_url",
+    timestamp_field="created_at",  # V9.3: Ch2 wird via Timestamp-LSB kodiert
 )
 
 ga = GhostAuditInterceptor(
@@ -170,7 +172,7 @@ Fünf physische Carrier, per HMAC-Permutation pro Zeile auf logische Kanäle gem
 |-------|------|---------|------------|
 | Ch0 | `bio` | Synonym-Switching (`currently/presently`, `active/online`, `working/operating`, `system/platform`) | TRIM, lowercase |
 | Ch1 | `trust_score` | Float LSB-Matching ±1 (stochastisch) | Float-Rounding |
-| Ch2 | `bio` | `TextShapeCarrier` — opportunistische Interpunktions-/Textform-Variante | Korpusabhängig, Kapazität variiert |
+| Ch2 | `created_at` (Timestamp-LSB) | Float/Integer/TEXT → `_parse_timestamp_to_int` → LSB-Embedding (scale=1 für ms, scale=1000 für s) | Keines — write-once, kein ORM-Touch |
 | Ch3 | `profile_score` | Float LSB-Matching ±1 (ORM-unabhängig von `bio`) | Float-Rounding |
 | Ch4 | `avatar_url` | Tilde-Suffix (`~` = Bit 1) — RFC-3986 unreserved | URL-Normalisierung |
 
@@ -184,9 +186,9 @@ Fünf physische Carrier, per HMAC-Permutation pro Zeile auf logische Kanäle gem
 
 **Thread-Safety (V9.2):** Der Interceptor ist durch ein internes `threading.Lock` gegen Race-Conditions in Multi-Threaded-Umgebungen (WSGI/ASGI) geschützt.
 
-**Bio-SPOF Fix (V8):** Carrier 3 war ursprünglich Case-Switching auf `bio`. ORM-Normalisierung hätte damit 3/5 Carrier gleichzeitig zerstört. `profile_score` ist eine unabhängige Float-Spalte — Bio-Normalize killt jetzt nur noch 2/5 Carrier.
+**Bio-SPOF Fix (V8 → V9):** Carrier 3 war ursprünglich Case-Switching auf `bio` (V7). ORM-Normalisierung hätte damit 3/5 Carrier gleichzeitig zerstört. V8 zog Ch2 auf `profile_score` (unabhängige Float-Spalte) — Bio-Normalize killte nur noch 2/5. **V9 eliminiert den Bio-SPOF endgültig:** Ch2 liegt auf `created_at` (Timestamp-LSB), einem write-once-Feld ohne ORM-Exposition. Bio-TRIM/lowercase killt jetzt nur noch **1/5 Carrier** (Ch0).
 
-**TextShapeCarrier (V9):** Der frühere Trailing-Space-Carrier wurde im V9-Payload-Pfad durch einen opportunistischen Textform-Carrier ersetzt. Er schreibt nur auf Rows mit sicherer, lokal decodierbarer Textform; andernfalls wird die Row per row-level gating übersprungen und das pending Payload-Bit nicht verbraucht.
+**TextShapeCarrier (V9, Fallback):** Der frühere Trailing-Space-Carrier wurde im V9-Payload-Pfad durch einen opportunistischen Textform-Carrier ersetzt. Seit V9.3 ist er **Fallback** für Ch2: primär wird Ch2 via Timestamp-LSB auf `created_at` (oder einem konfigurierten Timestamp-Feld) kodiert. Nur wenn kein Timestamp-Feld konfiguriert ist (`timestamp_field=""`), fällt das System auf TextShape zurück.
 
 **Temporal Delay (V9):** Payloads starten nicht immer sofort auf der ersten elegiblen Row. Ein kleiner deterministischer `temporal_delay_rows`-Puffer glättet den direkten `log_event()` → `intercept()`-Pfad, damit das Schreibmuster weniger eng an einzelne Audit-Events gebunden ist.
 
@@ -225,6 +227,9 @@ Von innen nach außen:
 - Vollständig eingebettete Payloads werden später per `flush_headers()` bzw. automatisch vor `recover_events()` mit V7-Headern versehen
 - Synonym-Encoding kann via `calibrate()` aus echten Rows an die lokale Textverteilung angepasst werden
 - V7 ECC/RAID-6, HMAC-Shuffling, Merkle, Rollback-Schutz und Checkpoints bleiben als Engine-Primitiven erhalten
+- `timestamp_field` in `CarrierConfig`: Ch2 wechselt von `bio` (TextShape) auf Timestamp-LSB (`created_at` o.ä.) — kein Bio-SPOF mehr, nur 1/5 Carrier betroffen bei ORM-Normalisierung
+- `carrier_schema_version` in `sys_cache_scheduler_state` migriert automatisch von V1 (kein Timestamp) zu V2 (Timestamp) beim ersten Start mit `timestamp_field`
+- `_parse_timestamp_to_int`: Typ-sicheres Parsen von INTEGER (ms), REAL (Sekunden vs. ms via `<1e11`-Heuristik) und TEXT (ISO-8601 mit Z)
 - **V9.1+:** Adaptive Probability Scheduler, persistente Queue, Reject-New Overflow-Schutz und Thread-Safety.
 
 ### V8 — Multiplexing & RAID-6
@@ -420,7 +425,7 @@ python tests/test_v9_active_analyst.py
 
 **Architektur-Implikation:** Die Tests verwenden `ga._engine.conn` direkt für Datenbank-Manipulationen, um Transaktionsisolierung mit dem Interceptor zu gewährleisten. Separate `sqlite3.connect()`-Verbindungen können in WAL-Mode zu Konflikten mit dem `_write_gate` führen.
 
-**Manifest-Integrität:** Die `_sys_cache_row_mac`-Funktion in [`ghost_audit_v9.py`](file:///c:/Users/tobs/.cursor/workspace/err/core/ghost_audit_v9.py) hasht 5 separate 8-Byte-MACs direkt über die rohen Carrier-Feldwerte (mit 6-stelliger Float-Rundung), sodass das Manifest konsistent bleibt, auch wenn die Carrier-Rows durch steganografische Operationen modifiziert werden.
+**Manifest-Integrität:** Die `_sys_cache_row_mac`-Funktion in [`ghost_audit_v9.py`](file:///c:/Users/tobs/.cursor/workspace/err/core/ghost_audit_v9.py) hasht 5 separate 8-Byte-MACs über die rohen Carrier-Feldwerte (mit 6-stelliger Float-Rundung) plus optional den `timestamp_value` (als `>q` packed, wenn nicht `None`), sodass das Manifest konsistent bleibt, auch wenn die Carrier-Rows durch steganografische Operationen modifiziert werden. Der Timestamp wird nur dann in den MAC einbezogen, wenn ein `timestamp_field` konfiguriert und der Wert ein `int` ist (`None` = Backward Compat).
 
 ---
 
@@ -481,6 +486,7 @@ carrier = CarrierConfig(
     float_a_field="trust_score",
     float_b_field="profile_score",
     tilde_field="avatar_url",
+    timestamp_field="created_at",  # V9.3: Ch2 Timestamp-LSB (optional, "" deaktiviert)
     slot_size=1600,
     slot_count=5,
 )
@@ -513,6 +519,7 @@ fields = {
     "trust_score": new_score,
     "profile_score": new_profile,
     "avatar_url": new_avatar,
+    "created_at": current_ts,    # V9.3: Ch2 Timestamp-LSB — write-once, nie vom ORM berührt
 }
 fields = ga.intercept(row_id=user_id, fields=fields)
 # ↑ intercept() darf die Werte minimal transformieren (TextShape, Synonym,
@@ -535,9 +542,10 @@ ga.flush_headers()
   die DB, wenn das Update nur ein Subset betrifft — das ist Sache der App,
   nicht von GhostAudit).
 - `intercept()` kennt **keinen** Vorher-Wert. Es arbeitet ausschließlich auf
-  dem übergebenen Dict. Wenn `bio` keine TextShape-Carrier-Form trägt, wird
-  die Row übersprungen und das pending Bit auf eine andere elegible Row
-  verteilt.
+  dem übergebenen Dict. Wenn ein Carrier-Feld (z.B. `bio` für Ch0) keine
+  geeignete Embedding-Form trägt oder der Timestamp-Wert nicht parsbaren
+  Typs ist (INTEGER/REAL/TEXT ISO-8601), wird die Row übersprungen und das
+  pending Bit auf eine andere elegible Row verteilt.
 - Der Rückgabewert ist **immer** ein vollständiges Dict mit denselben Keys
   wie `fields`. Auch wenn kein Bit eingebettet wurde, ist `returned == input`
   mit identischen Werten — die App kann bedingungslos schreiben.
@@ -677,7 +685,7 @@ python tests/benchmark_throughput_v8.py
 - **Forschungsprototyp** — kein produktionsreifes Auditsystem
 - V9 benötigt genügend echte Carrier-Rows und App-Writes, um pending Payload-Bits vollständig einzubetten.
 - Header-Rows werden aktuell slotweise direkt über die GhostAudit-Engine geschrieben; Payload-Writes laufen über den App-Hook.
-- ORM-Textnormalisierung (TRIM, lowercase, synonym-flatten) zerstört bio-basierte Carrier. Bio-SPOF Fix reduziert das von 3/5 auf 2/5 Carrier-Kill.
+- ORM-Textnormalisierung (TRIM, lowercase, synonym-flatten) zerstört bio-basierte Carrier. Bio-SPOF Fix (V9.3) eliminiert Ch2 via Timestamp-LSB → nur noch **1/5 Carrier** betroffen (Ch0).
 - RAID-6 toleriert **beliebige** 2/5 Carrier-Kill. Bei 3/5 ist keine Recovery möglich.
 - Forward Security schützt Slots voneinander, nicht vor Verlust des Master-Keys.
 - Rollback-Schutz hat eine dokumentierte Grenze: Werden DB und `.evolve`-Datei gemeinsam aus demselben Snapshot wiederhergestellt, wird kein Rollback erkannt.

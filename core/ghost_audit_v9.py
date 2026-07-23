@@ -125,7 +125,8 @@ class _V9Engine(GhostAuditV7):
             self.SLOT_COUNT = self._init_slot_count
 
     def _decode_channel_bit(self, channel: int, bio: str, score: float,
-                            profile_score: float = 0.0, avatar_url: str = ""):
+                            profile_score: float = 0.0, avatar_url: str = "",
+                            timestamp_value: int = 0):
         """Decode a bit from physical carrier (0-4), matching V9 carriers."""
         if channel == 0:      # Data: Semantic (bio synonym switching)
             if self.semantic_calibrator and self.semantic_calibrator._fitted:
@@ -134,7 +135,9 @@ class _V9Engine(GhostAuditV7):
             return StegoEngine.decode_bit_semantic(bio)
         elif channel == 1:    # Data: Float-LSB (trust_score)
             return StegoEngine.decode_bit_float_lsb(score, scale=self.float_scale)
-        elif channel == 2:    # Data: TextShape (Oxford Comma)
+        elif channel == 2:    # Data: Timestamp-LSB (or TextShape fallback)
+            if self._carrier_config and self._carrier_config.timestamp_field:
+                return StegoEngine.decode_bit_float_lsb(float(timestamp_value), scale=1)
             bit = TextShapeCarrier.decode_bit(bio)
             return bit if bit is not None else 0
         elif channel == 3:    # P Parity: Float-LSB (profile_score)
@@ -146,12 +149,17 @@ class _V9Engine(GhostAuditV7):
     def _encode_channel_bit(self, channel: int, bio: str, score: float, bit: int,
                             row_id=None, profile_score: float = 0.0,
                             avatar_url: str = ""):
-        """Encode a bit to physical carrier (0-4), matching V9 carriers."""
+        """Encode a bit to physical carrier (0-4), matching V9 carriers.
+
+        NOTE: Channel 2 (timestamp LSB) is handled by the Interceptor's
+        intercept_result() path. This engine-level override keeps TextShape
+        fallback for V7 compatibility paths.
+        """
         if channel == 0:      # Data: Semantic (bio)
             return StegoEngine.encode_bit_semantic(bio, bit), score, profile_score, avatar_url
         elif channel == 1:    # Data: Float-LSB (trust_score)
             return bio, StegoEngine.encode_bit_float_lsb(score, bit, row_id=row_id, scale=self.float_scale), profile_score, avatar_url
-        elif channel == 2:    # Data: TextShape (Oxford Comma)
+        elif channel == 2:    # Data: TextShape fallback (V7 compat)
             res = TextShapeCarrier.encode_bit(bio, bit)
             return res.text, score, profile_score, avatar_url
         elif channel == 3:    # P Parity: Float-LSB (profile_score)
@@ -160,8 +168,14 @@ class _V9Engine(GhostAuditV7):
             return bio, score, profile_score, StegoEngine.encode_bit_avatar_url(avatar_url, bit, row_id=row_id)
         raise ValueError(f"Unknown channel: {channel}")
 
-    def _sys_cache_row_mac(self, row_id, bio, score, profile_score=0.0, avatar_url=""):
-        """V9: Calculate 5 separate 8-Byte MACs over raw carrier field values."""
+    def _sys_cache_row_mac(self, row_id, bio, score, profile_score=0.0, avatar_url="",
+                           timestamp_value: int | None = None):
+        """V9: Calculate 5 separate 8-Byte MACs over raw carrier field values.
+        
+        When ``timestamp_value`` is ``None`` (default), the timestamp is excluded
+        from the MAC — backward-compatible with configs that have no timestamp_field.
+        When a number is provided, it is canonicalised to int64 and included.
+        """
         
         # Slot-based key for MAC calculation
         slot_idx = self._get_slot_idx_for_row(row_id)
@@ -179,6 +193,8 @@ class _V9Engine(GhostAuditV7):
         data_to_mac_base += struct.pack(">d", rounded_score) # double for float
         data_to_mac_base += struct.pack(">d", rounded_profile_score) # double for float
         data_to_mac_base += avatar_url.encode('utf-8') if avatar_url is not None else b''
+        if timestamp_value is not None:
+            data_to_mac_base += struct.pack(">q", int(timestamp_value))
         
         blob = b""
         for c in range(5): # Iterate for each of the 5 logical channels
@@ -206,21 +222,31 @@ class _V9Engine(GhostAuditV7):
         try:
             cursor.execute(f"DELETE FROM {self.AUX_MANIFEST_TABLE}")
             
-            # Select using V9 configured field names
+            # Build SELECT fields: all known carriers + optional timestamp_field
+            select_fields = [
+                cfg.id_field, cfg.semantic_field,
+                cfg.float_a_field, cfg.float_b_field, cfg.tilde_field,
+            ]
+            if cfg.timestamp_field and cfg.timestamp_field not in select_fields:
+                select_fields.append(cfg.timestamp_field)
+            
             cursor.execute(
-                f"SELECT {cfg.id_field}, {cfg.semantic_field}, {cfg.float_a_field}, "
-                f"{cfg.float_b_field}, {cfg.tilde_field} "
+                f"SELECT {', '.join(select_fields)} "
                 f"FROM {cfg.table} ORDER BY {cfg.id_field} ASC"
             )
             
             manifest_rows = []
+            has_ts = bool(cfg.timestamp_field)
             for row in cursor.fetchall():
-                row_id, bio, fa, fb, til = row
+                row_id, bio, fa, fb, til = row[:5]
+                ts_raw = row[5] if has_ts and len(row) > 5 else None
+                ts_val = (GhostAuditInterceptor._parse_timestamp_to_int(ts_raw)
+                          if ts_raw is not None else None)
                 if bio is None or fa is None:
                     continue
                 
                 manifest_rows.append(
-                    (row_id, self._sys_cache_row_mac(row_id, bio, fa, fb, til))
+                    (row_id, self._sys_cache_row_mac(row_id, bio, fa, fb, til, ts_val))
                 )
                 
             if manifest_rows:
@@ -232,7 +258,8 @@ class _V9Engine(GhostAuditV7):
         finally:
             self._set_sys_cache_write_mode(False, commit=True)
 
-    def _verify_sys_cache_row(self, row_id, bio, score, profile_score=0.0, avatar_url=""):
+    def _verify_sys_cache_row(self, row_id, bio, score, profile_score=0.0, avatar_url="",
+                              timestamp_value: int | None = None):
          """Verify the integrity of a sys_cache row using its manifest HMAC."""
          cursor = self.conn.cursor()
          cursor.execute(
@@ -244,7 +271,9 @@ class _V9Engine(GhostAuditV7):
              return False # In V9, we expect a manifest entry for every row
          
          stored_mac = res[0]
-         current_mac = self._sys_cache_row_mac(row_id, bio, score, profile_score, avatar_url)
+         current_mac = self._sys_cache_row_mac(
+             row_id, bio, score, profile_score, avatar_url, timestamp_value
+         )
          
          return hmac.compare_digest(stored_mac, current_mac)
 
@@ -435,6 +464,7 @@ class _V9Engine(GhostAuditV7):
                 avg_event_interval_ema REAL NOT NULL DEFAULT 0.0,
                 last_intercept_time REAL NOT NULL DEFAULT 0.0,
                 last_event_time REAL NOT NULL DEFAULT 0.0,
+                carrier_schema_version INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -442,6 +472,13 @@ class _V9Engine(GhostAuditV7):
         cursor.execute(
             "INSERT OR IGNORE INTO sys_cache_scheduler_state (id) VALUES (1)"
         )
+        # Migration: add carrier_schema_version for pre-existing tables
+        cols = {r[1] for r in cursor.execute("PRAGMA table_info(sys_cache_scheduler_state)")}
+        if "carrier_schema_version" not in cols:
+            cursor.execute(
+                "ALTER TABLE sys_cache_scheduler_state ADD COLUMN "
+                "carrier_schema_version INTEGER NOT NULL DEFAULT 1"
+            )
         self.conn.commit()
 
 
@@ -656,6 +693,7 @@ def _encode_bit_into_fields(
     fa  = config.float_a_field
     fb  = config.float_b_field
     til = config.tilde_field
+    ts_field = config.timestamp_field
 
     # carrier 0: semantic synonym (bio)
     if sem in result and result[sem] is not None:
@@ -670,8 +708,21 @@ def _encode_bit_into_fields(
             result[fa], bit, row_id=row_id, scale=float_scale
         )
 
-    # carrier 2: text-shape carrier (same field as semantic)
-    if sem in result and result[sem] is not None:
+    # carrier 2: timestamp LSB (fallback to text-shape if no timestamp_field)
+    if ts_field and ts_field in result and result[ts_field] is not None:
+        ts_raw = result[ts_field]
+        # REAL Unix seconds → scale=1000, keep as REAL
+        if isinstance(ts_raw, float) and ts_raw < 1e11:
+            result[ts_field] = StegoEngine.encode_bit_float_lsb(
+                ts_raw, bit, row_id=row_id, scale=1000
+            )
+        else:
+            # INTEGER ms or TEXT → canonical int64, scale=1, return int
+            ts_int = GhostAuditInterceptor._parse_timestamp_to_int(ts_raw) or 0
+            result[ts_field] = int(round(StegoEngine.encode_bit_float_lsb(
+                float(ts_int), bit, row_id=row_id, scale=1
+            )))
+    elif not ts_field and sem in result and result[sem] is not None:
         encoded = TextShapeCarrier.encode_bit(result[sem], bit)
         if encoded.written:
             result[sem] = encoded.text
@@ -702,6 +753,7 @@ def _decode_bit_from_fields(
     fa  = config.float_a_field
     fb  = config.float_b_field
     til = config.tilde_field
+    ts_field = config.timestamp_field
 
     if sem in fields and fields[sem]:
         b = (calibrator.decode_bit(fields[sem])
@@ -715,7 +767,13 @@ def _decode_bit_from_fields(
         if b is not None:
             votes.append(b)
 
-    if sem in fields and fields[sem]:
+    # carrier 2: timestamp LSB (fallback to text-shape)
+    if ts_field and ts_field in fields and fields[ts_field] is not None:
+        ts_val = float(GhostAuditInterceptor._parse_timestamp_to_int(fields[ts_field]))
+        b = StegoEngine.decode_bit_float_lsb(ts_val, scale=1)
+        if b is not None:
+            votes.append(b)
+    elif not ts_field and sem in fields and fields[sem]:
         b = TextShapeCarrier.decode_bit(fields[sem])
         if b is not None:
             votes.append(b)
@@ -949,10 +1007,21 @@ class GhostAuditInterceptor:
         self._intercept_count = 0
         self._restarted = True
         self._lock = threading.RLock()
+        self._carrier_schema_version = 1
 
         # Load persisted state
         self._load_scheduler_state()
         self._load_pending_queue()
+
+        # Migration: if timestamp_field is newly enabled, force manifest rebuild
+        # so all rows have MACs that include the canonical timestamp value.
+        if (self.config.timestamp_field
+            and self._carrier_schema_version < 2):
+            if self.verbose:
+                print("[V9] Carrier schema v1→v2: rebuilding manifest with timestamp_field")
+            self._engine._rebuild_sys_cache_manifest()
+            self._carrier_schema_version = 2
+            self._save_scheduler_state()
 
         # For external carrier: populate _orig_ids from real table rows
         if is_external:
@@ -970,14 +1039,16 @@ class GhostAuditInterceptor:
         cursor.execute(
             """
             SELECT app_write_rate_ema, avg_event_interval_ema, 
-                   last_intercept_time, last_event_time 
+                   last_intercept_time, last_event_time,
+                   carrier_schema_version
             FROM sys_cache_scheduler_state WHERE id=1
             """
         )
         row = cursor.fetchone()
         if row:
             (self._app_write_rate_ema, self._avg_event_interval_ema, 
-             self._last_intercept_time, self._last_event_time) = row
+             self._last_intercept_time, self._last_event_time,
+             self._carrier_schema_version) = row
 
     def _save_scheduler_state(self):
         cursor = self._engine.conn.cursor()
@@ -988,11 +1059,13 @@ class GhostAuditInterceptor:
                 avg_event_interval_ema = ?,
                 last_intercept_time = ?,
                 last_event_time = ?,
+                carrier_schema_version = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = 1
             """,
             (self._app_write_rate_ema, self._avg_event_interval_ema, 
-             self._last_intercept_time, self._last_event_time)
+             self._last_intercept_time, self._last_event_time,
+             self._carrier_schema_version)
         )
         self._engine.conn.commit()
 
@@ -1214,6 +1287,53 @@ class GhostAuditInterceptor:
             )
         return stats
 
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _parse_timestamp_to_int(val) -> int | None:
+        """Normalize a timestamp field value to int64 (Unix ms).
+
+        Handles SQLite type chaos:
+          - INTEGER         → Unix ms, direkt
+          - REAL            → Unix **seconds** (< 1e11) oder Unix ms (≥ 1e11)
+          - TEXT ISO-8601   → „2024-01-15 14:23:07.832[Z]" o.Ä.
+
+        Returns ``None`` when *val* is empty/unparseable.
+        """
+        if val is None:
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            if val < 1e11:          # Unix seconds (bis ~Sep 5138)
+                return int(round(val * 1000))
+            return int(val)         # schon ms
+        if isinstance(val, str):
+            val = val.strip()
+            if not val:
+                return None
+            try:
+                return int(val)
+            except ValueError:
+                pass
+            try:
+                from datetime import datetime, timezone
+                # Strip trailing Z / UTC offset for parsing
+                clean = val.upper().rstrip("Z").replace("T", " ")
+                for fmt in [
+                    "%Y-%m-%d %H:%M:%S.%f",
+                    "%Y-%m-%d %H:%M:%S",
+                ]:
+                    try:
+                        dt = datetime.strptime(clean, fmt)
+                        dt = dt.replace(tzinfo=timezone.utc)
+                        return int(dt.timestamp() * 1000)
+                    except ValueError:
+                        continue
+            except ImportError:
+                pass
+        return None
+
     # ------------------------------------------------------------------ intercept API
 
     def intercept(self, row_id: Any, fields: dict[str, Any]) -> dict[str, Any]:
@@ -1377,13 +1497,30 @@ class GhostAuditInterceptor:
                         scale=self._float_calibrator.best_scale
                     )
             elif physical_idx == 2:
-                if sem in result and result[sem] is not None:
+                ts_field = cfg.timestamp_field
+                if ts_field and ts_field in result and result[ts_field] is not None:
+                    ts_raw = result[ts_field]
+                    ts_int = self._parse_timestamp_to_int(ts_raw)
+                    # Encode LSB on canonical INT64 ms, then preserve input type
+                    if isinstance(ts_raw, float) and ts_raw < 1e11:
+                        # REAL Unix seconds → scale=1000, keep as REAL
+                        encoded = StegoEngine.encode_bit_float_lsb(
+                            float(ts_raw), bit, row_id=row_id, scale=1000
+                        )
+                        result[ts_field] = encoded
+                    else:
+                        # INTEGER ms or REAL ms → scale=1, cast back to int
+                        encoded = StegoEngine.encode_bit_float_lsb(
+                            float(ts_int), bit, row_id=row_id, scale=1
+                        )
+                        result[ts_field] = int(round(encoded))
+                elif not ts_field and sem in result and result[sem] is not None:
                     encoded = TextShapeCarrier.encode_bit(result[sem], bit)
                     if not encoded.written:
                         return InterceptResult(dict(fields), False, f"carrier_gating:{encoded.reason}", row_id)
                     result[sem] = encoded.text
                 else:
-                    return InterceptResult(dict(fields), False, "carrier_gating:missing_text", row_id)
+                    return InterceptResult(dict(fields), False, "carrier_gating:no_timestamp", row_id)
             elif physical_idx == 3:
                 if fb in result and result[fb] is not None:
                     if self._float_warmup_samples > 0 and not self._float_calibrator.ready:
@@ -1400,16 +1537,18 @@ class GhostAuditInterceptor:
 
             payload.advance(target_channel)
 
-            # Update manifest for the modified row.
-            # While the app hasn't written the row yet, we update our manifest
-            # with the MAC of the fields we are returning. If the app rollbacks,
-            # the manifest will correctly mark this row as corrupted/erasure.
+            # Compute MAC from the modified fields (including timestamp if configured).
+            # The MAC is written BEFORE the app commits, so any app rollback
+            # creates a MAC mismatch → erasure → RAID-6 recovery.
+            ts_raw = result.get(cfg.timestamp_field) if cfg.timestamp_field else None
+            ts_val = self._parse_timestamp_to_int(ts_raw) if ts_raw is not None else None
             new_mac = self._engine._sys_cache_row_mac(
                 row_id,
                 result.get(cfg.semantic_field, ""),
                 result.get(cfg.float_a_field, 0.0),
                 result.get(cfg.float_b_field, 0.0),
-                result.get(cfg.tilde_field, "")
+                result.get(cfg.tilde_field, ""),
+                ts_val,
             )
             self._engine._set_sys_cache_write_mode(True, commit=False)
             try:
@@ -1485,15 +1624,18 @@ class GhostAuditInterceptor:
     def decode_row(self, row_id: Any, fields: dict[str, Any]) -> dict[int, int]:
         """Decode all 5 logical channel bits from a carrier row's field values.
 
-        Returns {logical_channel: bit} dict.  V9 uses TextShape for physical
-        carrier 2, replacing V7's trailing-space carrier.
+        Returns {logical_channel: bit} dict.  V9 uses Timestamp-LSB for physical
+        carrier 2, falling back to TextShape if no timestamp_field configured.
         """
+        ts_raw = fields.get(self.config.timestamp_field) if self.config.timestamp_field else None
+        ts_val = self._parse_timestamp_to_int(ts_raw) if ts_raw is not None else None
         return self._decode_all_columns_v9(
             row_id,
             fields.get(self.config.semantic_field, ""),
             fields.get(self.config.float_a_field, 0.0),
             fields.get(self.config.float_b_field, 0.0),
             fields.get(self.config.tilde_field, ""),
+            ts_val,
         )
 
     def _decode_all_columns_v9(
@@ -1503,8 +1645,10 @@ class GhostAuditInterceptor:
         score: float,
         profile_score: float = 0.0,
         avatar_url: str = "",
+        timestamp_value: int = 0,
     ) -> dict[int, int | None]:
         mapping = self._engine._get_row_carrier_mapping(row_id)
+        cfg = self.config
         logical_bits: dict[int, int | None] = {}
 
         for physical_carrier in range(5):
@@ -1518,7 +1662,12 @@ class GhostAuditInterceptor:
                     score, scale=self._float_calibrator.best_scale
                 )
             elif physical_carrier == 2:
-                bit = TextShapeCarrier.decode_bit(bio)
+                if cfg.timestamp_field:
+                    bit = StegoEngine.decode_bit_float_lsb(
+                        float(timestamp_value), scale=1
+                    )
+                else:
+                    bit = TextShapeCarrier.decode_bit(bio)
             elif physical_carrier == 3:
                 bit = StegoEngine.decode_bit_float_lsb(
                     profile_score, scale=self._float_calibrator.best_scale
@@ -1707,11 +1856,19 @@ class GhostAuditInterceptor:
             header_ids   = slot_ids[:hdr_count]
             payload_ids  = slot_ids[hdr_count:]
 
+            # ---- Build SELECT fields (all carriers + optional timestamp) ----
+            sel_fields = [
+                cfg.id_field, cfg.semantic_field,
+                cfg.float_a_field, cfg.float_b_field, cfg.tilde_field,
+            ]
+            if cfg.timestamp_field and cfg.timestamp_field not in sel_fields:
+                sel_fields.append(cfg.timestamp_field)
+            sel_cols = ', '.join(sel_fields)
+
             # ---- Decode header bits ----
             placeholders = ",".join("?" * len(header_ids))
             cursor.execute(
-                f"SELECT {cfg.id_field}, {cfg.semantic_field}, "
-                f"{cfg.float_a_field}, {cfg.float_b_field}, {cfg.tilde_field} "
+                f"SELECT {sel_cols} "
                 f"FROM {cfg.table} WHERE {cfg.id_field} IN ({placeholders}) "
                 f"ORDER BY {cfg.id_field}",
                 header_ids,
@@ -1722,7 +1879,7 @@ class GhostAuditInterceptor:
             for rid in header_ids:
                 row = hdr_rows.get(rid)
                 if row:
-                    _, bio, fa, fb, til = row
+                    _, bio, fa, fb, til = row[:5]
                     bit = e._decode_header_bit(rid, bio, fa,
                                              profile_score=fb, avatar_url=til)
                     h_bits.append(bit)
@@ -1769,8 +1926,7 @@ class GhostAuditInterceptor:
 
             placeholders = ",".join("?" * len(payload_ids))
             cursor.execute(
-                f"SELECT {cfg.id_field}, {cfg.semantic_field}, "
-                f"{cfg.float_a_field}, {cfg.float_b_field}, {cfg.tilde_field} "
+                f"SELECT {sel_cols} "
                 f"FROM {cfg.table} WHERE {cfg.id_field} IN ({placeholders}) "
                 f"ORDER BY {cfg.id_field}",
                 payload_ids,
@@ -1790,12 +1946,15 @@ class GhostAuditInterceptor:
                 row = payload_rows.get(rid)
                 if not row:
                     continue
-                _, bio, fa, fb, til = row
+                _, bio, fa, fb, til = row[:5]
+                has_ts = bool(cfg.timestamp_field)
+                ts_val = self._parse_timestamp_to_int(row[5]) if has_ts and len(row) > 5 else None
                 
                 # Verify Row-MAC before extracting bits (Vector A resilience)
                 # If tampering is detected, we skip the row, which turns the error
                 # into an erasure for the RS decoder.
-                if not e._verify_sys_cache_row(rid, bio, fa, profile_score=fb, avatar_url=til):
+                if not e._verify_sys_cache_row(rid, bio, fa, profile_score=fb, avatar_url=til,
+                                               timestamp_value=ts_val):
                     if self.verbose:
                         print(f"[V9 DEBUG] Row MAC failed for rid={rid} - turning into erasure")
                     continue
@@ -1819,8 +1978,11 @@ class GhostAuditInterceptor:
                            else StegoEngine.decode_bit_semantic(bio))
                 elif physical_idx == 1: # float_a
                     bit = StegoEngine.decode_bit_float_lsb(fa, scale=self._float_calibrator.best_scale)
-                elif physical_idx == 2: # text_shape
-                    bit = TextShapeCarrier.decode_bit(bio)
+                elif physical_idx == 2: # timestamp_lsb or text_shape fallback
+                    if cfg.timestamp_field:
+                        bit = StegoEngine.decode_bit_float_lsb(float(ts_val), scale=1)
+                    else:
+                        bit = TextShapeCarrier.decode_bit(bio)
                 elif physical_idx == 3: # float_b
                     bit = StegoEngine.decode_bit_float_lsb(fb, scale=self._float_calibrator.best_scale)
                 elif physical_idx == 4: # avatar
