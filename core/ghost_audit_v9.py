@@ -725,7 +725,7 @@ class _V9Engine(GhostAuditV7):
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS sys_cache_pending_queue (
+            CREATE TABLE IF NOT EXISTS ghostaudit_pending_queue (
                 seq INTEGER PRIMARY KEY,
                 nsym INTEGER NOT NULL,
                 stored_msg_len INTEGER NOT NULL,
@@ -1471,7 +1471,7 @@ class GhostAuditInterceptor:
 
     def _load_pending_queue(self):
         cursor = self._engine.conn.cursor()
-        cursor.execute("SELECT * FROM sys_cache_pending_queue ORDER BY seq ASC")
+        cursor.execute("SELECT * FROM ghostaudit_pending_queue ORDER BY seq ASC")
         rows = cursor.fetchall()
         cols = [description[0] for description in cursor.description]
         
@@ -1508,7 +1508,7 @@ class GhostAuditInterceptor:
         cursor = self._engine.conn.cursor()
         cursor.execute(
             """
-            INSERT OR REPLACE INTO sys_cache_pending_queue (
+            INSERT OR REPLACE INTO ghostaudit_pending_queue (
                 seq, nsym, stored_msg_len, compressed, repetitions,
                 start_after_rows, rows_seen, pos_0, pos_1, pos_2, pos_3, pos_4,
                 channel_bits_json
@@ -1525,7 +1525,7 @@ class GhostAuditInterceptor:
 
     def _delete_payload(self, seq: int):
         cursor = self._engine.conn.cursor()
-        cursor.execute("DELETE FROM sys_cache_pending_queue WHERE seq = ?", (seq,))
+        cursor.execute("DELETE FROM ghostaudit_pending_queue WHERE seq = ?", (seq,))
         self._engine.conn.commit()
 
     # ------------------------------------------------------------------ capacity metrics
@@ -2463,7 +2463,7 @@ class GhostAuditInterceptor:
         if recovered_seqs is None:
             recovered_seqs = {seq for seq, _ in self.recover_events()}
 
-        cursor.execute("SELECT seq FROM sys_cache_pending_queue")
+        cursor.execute("SELECT seq FROM ghostaudit_pending_queue")
         pending_seqs = {r[0] for r in cursor.fetchall()}
 
         missing = sorted(audit_seqs - recovered_seqs - pending_seqs)

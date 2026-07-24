@@ -683,7 +683,7 @@ def test_external_carrier_intercept_and_log():
             fields = {"bio": bio, "trust_score": ts,
                       "profile_score": ps, "avatar_url": av}
             
-            # intercept() will write to sys_cache_pending_queue via ga's internal connection
+            # intercept() will write to ghostaudit_pending_queue via ga's internal connection
             final = ga.intercept(rid, fields)
             
             # Update the app table

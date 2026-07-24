@@ -123,7 +123,7 @@ def test_integrity_detects_gap():
         assert seq is not None
         # Pending Queue-Row löschen (simulierter Angriff)
         cursor = ga._engine.conn.cursor()
-        cursor.execute("DELETE FROM sys_cache_pending_queue WHERE seq = ?", (seq,))
+        cursor.execute("DELETE FROM ghostaudit_pending_queue WHERE seq = ?", (seq,))
         ga._engine.conn.commit()
         # audit_log hat den Event, aber weder pending noch recovered
         missing = ga.verify_pending_queue_integrity(recovered_seqs=set())
