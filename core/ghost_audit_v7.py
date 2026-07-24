@@ -1495,7 +1495,7 @@ class GhostAuditV7:
         else:
             return {"min_nsym": 24, "min_reps": 4}
 
-    def __init__(self, db_path="ghost_audit_v7.db", secret_key=None, key_provider=None, ecc_symbols=36, verbose=True, siem_export_path=None, siem_export_format="jsonl", metronome_interval=0, external_state_path=None, force_reinit=False):
+    def __init__(self, db_path="ghost_audit_v7.db", secret_key=None, key_provider=None, ecc_symbols=36, verbose=True, siem_export_path=None, siem_export_format="jsonl", metronome_interval=0, external_state_path=None, force_reinit=False, shares=None, share_threshold=2):
         self.db_path = db_path
         self.ecc_symbols = ecc_symbols
         self.verbose = verbose
@@ -1509,9 +1509,20 @@ class GhostAuditV7:
             external_state_path or ExternalStateCounter._default_path(db_path)
         )
 
-        # --- Master key acquisition ---
+        # --- Master key acquisition (priority: shares > key_provider > secret_key / env) ---
         master_key = None
-        if key_provider is not None:
+        if shares is not None:
+            from core.shamir_secret_sharing import reconstruct_from_sources
+            try:
+                master_key = reconstruct_from_sources(shares)
+                if verbose:
+                    print(f"[V7] Master key reconstructed from {len(shares)} shares (threshold={share_threshold})")
+            except Exception as e:
+                if verbose:
+                    print(f"[V7] SSS reconstruction failed: {e}")
+                raise
+
+        if master_key is None and key_provider is not None:
             try:
                 master_key = key_provider.get_master_key()
             except Exception as e:
@@ -1520,7 +1531,6 @@ class GhostAuditV7:
                 raise
 
         if master_key is None:
-            # Fallback to explicit secret_key param or environment
             if secret_key is None:
                 secret_key = os.environ.get("GHOST_AUDIT_KEY")
                 if not secret_key:

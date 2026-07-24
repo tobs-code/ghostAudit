@@ -20,10 +20,21 @@ carrier = CarrierConfig(
 integer_channel_field="ui_prefs", # V9.9: Ch0 Integer-LSB (kein Synonym-Fingerabdruck)
 )
 
+# Option A: Direkter Key (einfach)
 ga = GhostAuditInterceptor(
     db_path="app.db",
     carrier_config=carrier,
     secret_key=secrets.token_hex(32),
+)
+
+# Option B: Threshold Cryptography (V10) — Key nie vollständig an einem Ort
+# python scripts/init_shares.py --shares 3 --threshold 2 --out /mnt/a/share.db /mnt/b/share.db /mnt/c/share.db
+ga = GhostAuditInterceptor(
+    db_path="app.db",
+    carrier_config=carrier,
+    shares=[("/mnt/a/share.db","shamir_shares",1),
+            ("/mnt/b/share.db","shamir_shares",2)],
+    share_threshold=2,
 )
 ga.log_event("user=alice action=login ip=10.0.0.1")
 
@@ -114,7 +125,9 @@ Mit Rollback-Schutz und Heartbeat:
 ga = GhostAuditInterceptor(
     db_path="app.db",
     carrier_config=carrier,
-    secret_key="mein-key",
+    shares=[("/mnt/a/share.db","shamir_shares",1),
+            ("/mnt/b/share.db","shamir_shares",2)],
+    share_threshold=2,
     external_state_path="E:\\secure_mount\\audit.evolve",
     metronome_interval=300,   # Heartbeat alle 5 Minuten
     siem_export_path="audit.jsonl",
@@ -223,29 +236,23 @@ Von innen nach außen:
 
 ## Feature-Übersicht nach Version
 
-### V9 — Real-Carrier Interceptor
+### V7.1 — Forward Secrecy, Metronome, Per-Entry MACs
 
-- `GhostAuditInterceptor` nutzt eine vorhandene App-Tabelle statt synthetischer `sys_cache`-Rows
-- `CarrierConfig` macht Tabellen- und Feldnamen konfigurierbar (`users.bio`, `trust_score`, `profile_score`, `avatar_url`, ...)
-- `intercept(row_id, fields)` faltet Stego-Bits in den normalen App-Write ein: ein App-UPDATE, kein separater Carrier-Write pro Row
-- Header-Rows werden pro Slot reserviert; Payload-Bits werden nur in Payload-Rows eingebettet
-- Vollständig eingebettete Payloads werden später per `flush_headers()` bzw. automatisch vor `recover_events()` mit V7-Headern versehen
-- Synonym-Encoding kann via `calibrate()` aus echten Rows an die lokale Textverteilung angepasst werden
-- V7 ECC/RAID-6, HMAC-Shuffling, Merkle, Rollback-Schutz und Checkpoints bleiben als Engine-Primitiven erhalten
-- `timestamp_field` in `CarrierConfig`: Ch2 wechselt von `bio` (TextShape) auf Timestamp-LSB (`created_at` o.ä.) — kein Bio-SPOF mehr
-- `carrier_schema_version` migriert automatisch von V1 → V2 beim ersten Start mit `timestamp_field`
-- `_parse_timestamp_to_int`: Typ-sicheres Parsen von INTEGER (ms), REAL (Sekunden vs. ms via `<1e11`-Heuristik), TEXT (ISO-8601)
-- **V9.4 — TSA Witness (RFC 3161):** Background-Thread (30s Poll) submitte SHA256(.evolve)-Digest an Public Time-Stamp Authority (Multi-TSA-Fallback: freetsa.org → digicert → sectigo). Der signierte Timestamp-Token (TST) beweist Existenz des Checkpoints zu einem bestimmten Zeitpunkt. Best-Effort — bei TSA-Down bleiben Entries `pending`.
-- **V9.5 — Capacity Metrics:** `get_capacity_metrics()` liefert Row-Defizit, effective_payload_rows, Coverage-Schätzung, Queue-Auslastung. Early-Warning bei Queue >50%.
-- **V9.6 — Witness Health Alarm:** `get_status()` gibt `health`: healthy/degraded/stale (max_pending_age=300s). Once-per-cycle `logger.warning()` bei stale-Transition, kein Spam.
-- **V9.7 — App-Contract Verification:** `verify_write(row_id, fields_written)` prüft MAC nach App-UPDATE. One-shot pro Row (MAC wird aus `_pending_verify` entfernt). Bei Mismatch → `logger.warning`. `max_queue_size`-Cap verhindert unbeschränktes Wachstum.
-- **V9.8 — Multi-Process Desync:** `process_id`/`process_count`-Parameter. Modulo-basierte Row-Partitionierung (`rid % count == id`). Atomic Sequence Counter per `UPDATE sys_sequence_counter SET next_seq = next_seq + N`. Per-Process Key-Evolution (`fs_key_state.id = 1 + process_id`).
-- **V9.9 — Integer Channel Ch0:** `integer_channel_field` ersetzt Synonym-Switching durch Integer-LSB (`(current & ~1) | (bit & 1)`). Kein statistischer Fingerabdruck mehr — Ch0-Verteilung ist nicht von natürlichem Bitmask-Rauschen unterscheidbar. Fallback auf Synonym-Ch0 wenn das Feld nicht existiert. Alle 5 Kanäle jetzt ORM-resistent und statistisch unauffällig.
-- **V9.10 — Carrier Discovery:** `ghostaudit discover app.db users` → PRAGMA-basierter Schema-Scanner. Whitelist-Pattern-Matching für alle Carrier-Rollen mit Confidence-Scoring (0–100). `CarrierConfig.from_config_dict()` baut Config aus JSON. `schema_version` im generated Config.
-- **V9.11 — Metriken:** `MetricRegistry(ABC)` mit `NoopMetricRegistry` (zero overhead) und `PrometheusMetricRegistry` (prometheus_client). Drei Metriken im Interceptor: `carrier_erasure_total{channel}`, `recovery_total{status}`, `pending_payloads` (Gauge).
-- **V9.12 — try_flush():** Size-Trigger (`auto_flush_completed`, default 5) und Time-Trigger (`auto_flush_interval`, default 2.0s). Kein Timer-Daemon — embedded-library-safe. Aufruf nach `intercept_result()` und `_enqueue_event_bits()`.
-- **V9.13 — API-Glättung:** `CarrierConfig.from_config_dict(d)` filtert `schema_version`. `log_structured_event(**kwargs)` serialisiert nach JSON. QUICKSTART.md: 6 Schritte, erster Audit-Event in 5 Minuten.
-- **V9.14 — Docstrings:** Happy-Path in der Klasse, vollständiger `__init__`-Docstring (20 Parameter). Alle public-Methoden englisch, mit Return-Format und Querverweisen.
+**Forward Secrecy (Anchor-Keys)**
+- `_k_write_merkle` evolviert nach jedem `log_event()`: `k_n = HMAC(k_{n-1}, "evolve")`
+- Alter Key wird überschrieben → kein Fälschen alter Anchor-MACs mit aktuellem Speicherdump
+- `evolve_count` in `fs_key_state` persistiert → Key wird nach Neustart automatisch nachgezogen
+- Verifikation evolviert `k_merkle` von der Basis auf `key_version` → alte Anchors bleiben prüfbar
+
+**Metronome Heartbeats**
+- `metronome_interval` (Sekunden, default 0=aus) aktiviert periodische `[METRONOME] beat=N`-Events
+- `detect_truncation(recovered_events)` erkennt Heartbeat-Lücken (Hinweis auf gelöschte Events)
+- Heartbeat-Zustand in `fs_metronome` persistiert, überlebt Neustarts
+
+**Per-Entry MAC-Tags**
+- Jeder `log_event()` speichert `HMAC(k_hmac, seq + event_msg)` in `event_mac_tags`
+- `verify_event_mac(seq)` / `verify_all_event_macs()` für feingranulare Verifikation
+- Ergänzt Merkle-Root: Merkle sagt *dass* etwas geändert wurde, MAC-Tags sagen *welches* Event
 
 ### V8 — Multiplexing & RAID-6
 
@@ -406,25 +413,33 @@ Ein Both-Snapshot-Angriff müsste jetzt neben DB und `.evolve` auch den TSA-Log 
 **Warum kein vollständiger Event-Level Merkle-Tree?**
 Ein Inclusion Proof (O(log n) Sibling-Hashes pro Event) wäre nur dann stärker, wenn der Root-Hash extern gesichert ist — was der Checkpoint bereits leistet. Der vollständige Umbau würde Komplexität hinzufügen ohne zusätzlichen Schutz im GhostAudit-Threat-Model: Ein privilegierter Angreifer, der die DB kontrolliert, kann einen neuen konsistenten Tree berechnen. Der externe Checkpoint ist die eigentliche Vertrauensgrenze.
 
-### V7.1 — Forward Secrecy, Metronome, Per-Entry MACs
+### V9 — Real-Carrier Interceptor
 
-**Forward Secrecy (Anchor-Keys)**
-- `_k_write_merkle` evolviert nach jedem `log_event()`: `k_n = HMAC(k_{n-1}, "evolve")`
-- Alter Key wird überschrieben → kein Fälschen alter Anchor-MACs mit aktuellem Speicherdump
-- `evolve_count` in `fs_key_state` persistiert → Key wird nach Neustart automatisch nachgezogen
-- Verifikation evolviert `k_merkle` von der Basis auf `key_version` → alte Anchors bleiben prüfbar
+- `GhostAuditInterceptor` nutzt eine vorhandene App-Tabelle statt synthetischer `sys_cache`-Rows
+- `CarrierConfig` macht Tabellen- und Feldnamen konfigurierbar (`users.bio`, `trust_score`, `profile_score`, `avatar_url`, ...)
+- `intercept(row_id, fields)` faltet Stego-Bits in den normalen App-Write ein: ein App-UPDATE, kein separater Carrier-Write pro Row
+- Header-Rows werden pro Slot reserviert; Payload-Bits werden nur in Payload-Rows eingebettet
+- Vollständig eingebettete Payloads werden später per `flush_headers()` bzw. automatisch vor `recover_events()` mit V7-Headern versehen
+- Synonym-Encoding kann via `calibrate()` aus echten Rows an die lokale Textverteilung angepasst werden
+- V7 ECC/RAID-6, HMAC-Shuffling, Merkle, Rollback-Schutz und Checkpoints bleiben als Engine-Primitiven erhalten
+- `timestamp_field` in `CarrierConfig`: Ch2 wechselt von `bio` (TextShape) auf Timestamp-LSB (`created_at` o.ä.) — kein Bio-SPOF mehr
+- `carrier_schema_version` migriert automatisch von V1 → V2 beim ersten Start mit `timestamp_field`
+- `_parse_timestamp_to_int`: Typ-sicheres Parsen von INTEGER (ms), REAL (Sekunden vs. ms via `<1e11`-Heuristik), TEXT (ISO-8601)
+- **V9.4 — TSA Witness (RFC 3161):** Background-Thread (30s Poll) submitte SHA256(.evolve)-Digest an Public Time-Stamp Authority (Multi-TSA-Fallback: freetsa.org → digicert → sectigo). Der signierte Timestamp-Token (TST) beweist Existenz des Checkpoints zu einem bestimmten Zeitpunkt. Best-Effort — bei TSA-Down bleiben Entries `pending`.
+- **V9.5 — Capacity Metrics:** `get_capacity_metrics()` liefert Row-Defizit, effective_payload_rows, Coverage-Schätzung, Queue-Auslastung. Early-Warning bei Queue >50%.
+- **V9.6 — Witness Health Alarm:** `get_status()` gibt `health`: healthy/degraded/stale (max_pending_age=300s). Once-per-cycle `logger.warning()` bei stale-Transition, kein Spam.
+- **V9.7 — App-Contract Verification:** `verify_write(row_id, fields_written)` prüft MAC nach App-UPDATE. One-shot pro Row (MAC wird aus `_pending_verify` entfernt). Bei Mismatch → `logger.warning`. `max_queue_size`-Cap verhindert unbeschränktes Wachstum.
+- **V9.8 — Multi-Process Desync:** `process_id`/`process_count`-Parameter. Modulo-basierte Row-Partitionierung (`rid % count == id`). Atomic Sequence Counter per `UPDATE sys_sequence_counter SET next_seq = next_seq + N`. Per-Process Key-Evolution (`fs_key_state.id = 1 + process_id`).
+- **V9.9 — Integer Channel Ch0:** `integer_channel_field` ersetzt Synonym-Switching durch Integer-LSB (`(current & ~1) | (bit & 1)`). Kein statistischer Fingerabdruck mehr — Ch0-Verteilung ist nicht von natürlichem Bitmask-Rauschen unterscheidbar. Fallback auf Synonym-Ch0 wenn das Feld nicht existiert. Alle 5 Kanäle jetzt ORM-resistent und statistisch unauffällig.
+- **V9.10 — Carrier Discovery:** `ghostaudit discover app.db users` → PRAGMA-basierter Schema-Scanner. Whitelist-Pattern-Matching für alle Carrier-Rollen mit Confidence-Scoring (0–100). `CarrierConfig.from_config_dict()` baut Config aus JSON. `schema_version` im generated Config.
+- **V9.11 — Metriken:** `MetricRegistry(ABC)` mit `NoopMetricRegistry` (zero overhead) und `PrometheusMetricRegistry` (prometheus_client). Drei Metriken im Interceptor: `carrier_erasure_total{channel}`, `recovery_total{status}`, `pending_payloads` (Gauge).
+- **V9.12 — try_flush():** Size-Trigger (`auto_flush_completed`, default 5) und Time-Trigger (`auto_flush_interval`, default 2.0s). Kein Timer-Daemon — embedded-library-safe. Aufruf nach `intercept_result()` und `_enqueue_event_bits()`.
+- **V9.13 — API-Glättung:** `CarrierConfig.from_config_dict(d)` filtert `schema_version`. `log_structured_event(**kwargs)` serialisiert nach JSON. QUICKSTART.md: 6 Schritte, erster Audit-Event in 5 Minuten.
+- **V9.14 — Docstrings:** Happy-Path in der Klasse, vollständiger `__init__`-Docstring (20 Parameter). Alle public-Methoden englisch, mit Return-Format und Querverweisen.
+- **V9.15 — Pending Queue Attack Detection:** `verify_pending_queue_integrity()` prüft ob die persistierte Bit-Queue konsistent ist. Erkennt Manipulationen an `sys_cache_pending_queue` (Bit-Flips, truncation, reorder).
+- **V9.16 — Tabellen-Klarheit:** `sys_cache_pending_queue` → `ghostaudit_pending_queue` um Verwechslung mit `sys_cache` zu vermeiden. Rückwärtskompatibel via `ALTER TABLE IF EXISTS`.
 
-**Metronome Heartbeats**
-- `metronome_interval` (Sekunden, default 0=aus) aktiviert periodische `[METRONOME] beat=N`-Events
-- `detect_truncation(recovered_events)` erkennt Heartbeat-Lücken (Hinweis auf gelöschte Events)
-- Heartbeat-Zustand in `fs_metronome` persistiert, überlebt Neustarts
-
-**Per-Entry MAC-Tags**
-- Jeder `log_event()` speichert `HMAC(k_hmac, seq + event_msg)` in `event_mac_tags`
-- `verify_event_mac(seq)` / `verify_all_event_macs()` für feingranulare Verifikation
-- Ergänzt Merkle-Root: Merkle sagt *dass* etwas geändert wurde, MAC-Tags sagen *welches* Event
-
-### V9.2 — Active-Analyst Test Suite
+### V9.17 — Active-Analyst Test Suite
 
 V9.2 erweitert das Threat-Model um einen **aktiven Analysten** mit Schreibrechten, der gezielt Carrier-Rows manipuliert, um die Reaktion des Systems zu provozieren. Die Test-Suite in [`tests/test_v9_active_analyst.py`](file:///c:/Users/tobs/.cursor/workspace/err/tests/test_v9_active_analyst.py) deckt fünf Angriffsvektoren ab:
 
@@ -458,6 +473,54 @@ python tests/test_v9_active_analyst.py
 
 **Manifest-Integrität:** Die `_sys_cache_row_mac`-Funktion in [`ghost_audit_v9.py`](file:///c:/Users/tobs/.cursor/workspace/err/core/ghost_audit_v9.py) hasht 5 separate 8-Byte-MACs über die rohen Carrier-Feldwerte (mit 6-stelliger Float-Rundung) plus optional den `timestamp_value` (als `>q` packed, wenn nicht `None`), sodass das Manifest konsistent bleibt, auch wenn die Carrier-Rows durch steganografische Operationen modifiziert werden. Der Timestamp wird nur dann in den MAC einbezogen, wenn ein `timestamp_field` konfiguriert und der Wert ein `int` ist (`None` = Backward Compat).
 
+### V10 — Threshold Cryptography (Shamir's Secret Sharing)
+
+Der Master-Key ist nicht länger ein Single Point of Failure. GhostAudit kann den Key aus N Shares rekonstruieren, von denen beliebige K ausreichen (K-of-N Threshold). Der vollständige Key existiert nie an einem Ort.
+
+**Konzept:**
+- `split_secret(secret, N, K)` zerlegt den Master-Key in N Shares über GF(256) mit Lagrange-Interpolation
+- Jedes Share wird in einer **separaten SQLite-Datenbank** gespeichert (z.B. verschiedene Laufwerke/Mounts)
+- Bei Initialisierung müssen mindestens K Shares verfügbar sein → Rekonstruktion in memory
+- Der rekonstruierte Key wird nie persisted — nur die Shares existieren auf Disk
+
+**Nutzen:**
+- Ein Angreifer muss **K verschiedene Datenbanken** kompromittieren, nicht nur eine
+- Verlust eines einzelnen Shares ist harmlos (solange noch K verfügbar sind)
+- Physikalische Trennung der Share-DBs auf verschiedenen Datenträgern
+
+**Beispiel:**
+```python
+from core.shamir_secret_sharing import split_secret, create_share_db, write_share
+
+master_key = b"my-32-byte-master-key-for-ghost-audit!!"
+n, k = 5, 3
+shares = split_secret(master_key, n, k)
+
+for i in range(n):
+    create_share_db(f"/mnt/usb{i+1}/share.db")
+    write_share(f"/mnt/usb{i+1}/share.db", "shamir_shares", i+1, shares[i][1])
+
+# Später: initialisieren mit 3 beliebigen Shares
+ga = GhostAuditV7(db_path="app.db", shares=[
+    ("/mnt/usb1/share.db", "shamir_shares", 1),
+    ("/mnt/usb2/share.db", "shamir_shares", 2),
+    ("/mnt/usb3/share.db", "shamir_shares", 3),
+], share_threshold=3)
+```
+
+**CLI-Tool:**
+```bash
+python scripts/init_shares.py --shares 5 --threshold 3 \
+    --out /mnt/usb1/share.db /mnt/usb2/share.db /mnt/usb3/share.db \
+    /mnt/usb4/share.db /mnt/usb5/share.db
+```
+
+**Implementierung:**
+- Reines Python über GF(256) mit Generator 3 (primitives Element für Poly 0x11B)
+- Keine externen Abhängigkeiten — nur `os` + `sqlite3` + `struct`
+- Jedes Byte des Keys wird als Polynom-Koeffizient behandelt (byteweises SSS)
+- Kompatibel mit `key_provider=` und `secret_key=` — Shares haben höchste Priorität
+
 ---
 
 ## Konfiguration & Env-Vars
@@ -476,6 +539,7 @@ Alle Parameter haben sinnvolle Defaults und können per Env-Var überschrieben w
 | `GHOST_AUDIT_REBUILD_MIN_REPS` | `4` | Rebuild-Replikationen (Untergrenze, V8.4) |
 | `GHOST_AUDIT_REBUILD_THRESHOLD` | `0.35` | Degradations-Schwelle für Rebuild-Trigger (V8.4) |
 | `GHOST_AUDIT_REBUILD_INTERVAL` | `50` | Events zwischen zwei Idle-Checks (V8.4) |
+| `GHOST_AUDIT_SHARES` | — | Komma-separierte `db:table:id`-Triple für SSS (z.B. `/mnt/a/share.db:shamir_shares:1,/mnt/b/share.db:shamir_shares:2`) |
 
 **Beispiele (PowerShell):**
 
@@ -528,7 +592,7 @@ ga = GhostAuditInterceptor(
     db_path="app.db",
     carrier_config=carrier,    # None nutzt Legacy-sys_cache-Layout
     secret_key=None,           # oder GHOST_AUDIT_KEY env-var
-    key_provider=None,         # DPAPI / EnvKeyProvider
+    key_provider=None,         # DPAPI / EnvKeyProvider (niedrigste Priorität)
     ecc_symbols=36,
     verbose=True,
     siem_export_path=None,     # Auto-Export bei jedem log_event()
@@ -536,6 +600,8 @@ ga = GhostAuditInterceptor(
     metronome_interval=0,      # Heartbeat-Intervall in Sekunden (0=aus)
     external_state_path=None,  # Rollback-Erkennungsdatei
     force_reinit=False,        # Admin-Override: überspringt alle Rollback-Checks (für Tests / DB-Neuanlage)
+    shares=None,               # [(db_path, table, share_id), ...] — V10 Threshold Cryptography
+    share_threshold=2,         # K (Schwellwert) — wie viele Shares für Rekonstruktion nötig
 )
 ```
 
@@ -730,6 +796,12 @@ python tests/test_multichannel_degradation.py
 # Master-Testsuite (alle Läufe, JSON-Report)
 python tests/master_test_suite_v7.py
 
+# Shamir Secret Sharing (SSS) Tests
+python -m pytest tests/test_shamir_secret_sharing.py -v
+
+# Threshold Cryptography — Shares initialisieren
+python scripts/init_shares.py --shares 5 --threshold 3 --out /pfad/zu/share_1.db /pfad/zu/share_2.db /pfad/zu/share_3.db /pfad/zu/share_4.db /pfad/zu/share_5.db
+
 # Durchsatz-Benchmark
 python tests/benchmark_throughput_v8.py
 ```
@@ -738,12 +810,22 @@ python tests/benchmark_throughput_v8.py
 
 ## Testergebnisse
 
-### V9 Integration Test Suite — 49 Tests, 49 PASSED (Stand V9.14)
+### Gesamtsuite — 89 PASSED, 4 skipped (Stand V10)
 
-- 33 V9 Interceptor-Tests (CarrierConfig, Calibration, Intercept, Temporal Delay, Float Coverage, External Carrier, Multi-Process, Integer Channel Ch0, MAC-Verify, try_flush)
-- 5 Active-Analyst-Tests (Blast Radius, MAC-Strip, Backfill, Ch0-Erasure, Rollback-Detection)
-- 7 Discovery-Tests (PRAGMA, Pattern-Matching, Warning-Branches, generated Config)
-- 4 Metric-Tests (Noop-Registry, Interceptor-Integration, Size-Trigger, Time-Trigger)
+| Bereich | Tests | Status |
+|---------|-------|--------|
+| V9 Interceptor (CarrierConfig, Calibration, Intercept, Temporal Delay, Float Coverage, External Carrier, Multi-Process, Integer Channel Ch0, MAC-Verify, try_flush) | ~33 | ✅ |
+| Active-Analyst (Probe&Tamper, Column Wipe, Timing, Injection, Erasure) | 5 | ✅ |
+| Carrier Discovery (PRAGMA, Pattern-Matching, Warning-Branches, generated Config) | 7 | ✅ |
+| Metrics (Noop-Registry, Interceptor-Integration, Size-Trigger, Time-Trigger) | 4 | ✅ |
+| Hardware Resilience (Basic, Truncation, Corruption, Multi-Event, Physical) | 5 | ✅ |
+| Avatar Carrier V8 (StegoEngine, MAC, Shuffling, Bio-Normalize, Schema, ORM) | 10 | ✅ |
+| Härtungs-Tests V7 (LSB, Forward Security, Merkle, Export, Metronome, SIEM) | 1 | ✅ |
+| Partial Fragment Loss (RS Recovery, Labels, Mixed, Header, XOR Guard) | 6 | ✅ |
+| Stateful Recovery (Boundary, Partial, Close, Multi-Rotation) | 4 | ✅ |
+| Rollback Detection V8.2 | 1 | ✅ |
+| **Shamir SSS (Split, Reconstruct, SQL, GA-Integration)** | **10** | ✅ |
+| Debug-Skripte (keine Testsuiten) | 4 | ⏭️ skipped |
 
 ### Angriffssimulation V8
 
@@ -787,7 +869,7 @@ python tests/benchmark_throughput_v8.py
 - Header-Rows werden aktuell slotweise direkt über die GhostAudit-Engine geschrieben; Payload-Writes laufen über den App-Hook.
 - ORM-Textnormalisierung betrifft **keinen** Carrier mehr (V9.9: Ch0 via Integer-LSB, alle 5 Kanäle ORM-resistent).
 - RAID-6 toleriert **beliebige** 2/5 Carrier-Kill. Bei 3/5 ist keine Recovery möglich.
-- Forward Security schützt Slots voneinander, nicht vor Verlust des Master-Keys.
+- Forward Security schützt Slots voneinander, nicht vor Verlust des Master-Keys. **Seit V10 kann der Master-Key via Shamir's Secret Sharing auf N SQLite-DBs verteilt werden (K-of-N Threshold).** Der vollständige Key existiert nie an einem Ort — ein Angreifer muss mindestens K Datenbanken gleichzeitig kompromittieren.
 - Rollback-Schutz hatte eine dokumentierte Grenze: Werden DB und `.evolve`-Datei gemeinsam aus demselben Snapshot wiederhergestellt, wurde kein Rollback erkannt. **Seit V9.4 ist diese Lücke durch den TSA-Witness geschlossen** — der `.evolve`-Digest ist in einem Public Append-Only Log signiert. Ein Both-Snapshot müsste zusätzlich den TSA-Log kompromittieren.
 - `audit_archive` ist absichtlicher Köder — echte Recovery kommt aus der Carrier-Tabelle (`users` in V9, `sys_cache` im Legacy-Modus).
 
@@ -804,6 +886,7 @@ core/
 ├── discovery.py               Carrier-Discovery (PRAGMA-basiert, CLI+API)
 ├── metrics.py                 MetricRegistry-Interface + Noop + Prometheus-Impl
 ├── ghost_audit_v7.py          Engine und Legacy-sys_cache-Modus (V7–V8.x)
+├── shamir_secret_sharing.py   Threshold Cryptography (V10) — GF(256) SSS + SQL-Store
 ├── ecc_layer.py               Reed-Solomon Utilities
 ├── key_provider.py            DPAPI / EnvKeyProvider
 ├── timestamp_witness.py       RFC 3161 TSA-Witness (V9.4)
@@ -814,6 +897,7 @@ tests/
 ├── test_v9_interceptor.py     V9 Hook, echter Carrier, External-Carrier-Recovery
 ├── test_discovery.py          Carrier-Discovery (PRAGMA, Pattern-Matching, Warnungen)
 ├── test_metrics.py            Metric-Interface (Noop-Registry + Interceptor-Integration)
+├── test_shamir_secret_sharing.py SSS Split/Reconstruct, SQL-Store, GA-Integration (10 Tests)
 ├── quickstart_tests.py        Interaktives Testmenü
 ├── master_test_suite_v7.py    Orchestrator, erzeugt JSON-Report
 ├── attack_simulator_v8.py     5 Angriffsvektoren (MITRE ATT&CK)
@@ -821,10 +905,17 @@ tests/
 ├── gradual_decay_ramp_v82.py  50-Stufen BER-Sweep
 ├── sweep_wipe_v8.py           MUX Row-Wipe Sweep
 ├── test_rollback_v82.py       Rollback-Erkennung
-├── test_hardenings_v7.py      LSB, Forward Security, Merkle, Export
+├── test_hardenings_v7.py      LSB, Forward Security, Merkle, Export, Metronome, SIEM
+├── test_avatar_carrier_v8.py  V8 Avatar/Tilde-Carrier (10 Tests)
+├── test_partial_fragment_loss.py Fragment-Verlust, RS-Recovery, Labels (6 Tests)
+├── test_stateful_recovery.py  Stateful Buffer, Padding, Rotation (4 Tests)
 ├── test_multichannel_degradation.py  7 ORM-Szenarien
 ├── benchmark_throughput_v8.py Durchsatz-Benchmark
+├── test_v9_active_analyst.py  Active Analyst (5 Vektoren)
 └── hardware_resilience_test.py FileCarrier (binäre Datei statt SQLite)
+
+scripts/
+└── init_shares.py             CLI: Master-Key in N SQLite-Shards aufteilen (V10)
 
 docs/
 ├── README.md                  Diese Datei
