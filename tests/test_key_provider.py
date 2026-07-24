@@ -40,7 +40,7 @@ FAIL = "❌ FAIL"
 SKIP = "⏭️  SKIP"
 
 
-def test_dpapi_roundtrip(tmp_dir: str, verbose: bool) -> str:
+def _test_dpapi_roundtrip(tmp_dir: str, verbose: bool) -> str:
     """Protect a key with DPAPI, then unprotect and verify."""
     if not _IS_WIN:
         return SKIP
@@ -62,7 +62,7 @@ def test_dpapi_roundtrip(tmp_dir: str, verbose: bool) -> str:
         return f"{FAIL}: {e}"
 
 
-def test_dpapi_file_provider(tmp_dir: str, verbose: bool) -> str:
+def _test_dpapi_file_provider(tmp_dir: str, verbose: bool) -> str:
     """Write DPAPI blob to file, then use DPAPIKeyProvider to read it."""
     if not _IS_WIN:
         return SKIP
@@ -89,7 +89,7 @@ def test_dpapi_file_provider(tmp_dir: str, verbose: bool) -> str:
         return f"{FAIL}: {e}"
 
 
-def test_ghost_audit_with_dpapi_provider(tmp_dir: str, verbose: bool) -> str:
+def _test_ghost_audit_with_dpapi_provider(tmp_dir: str, verbose: bool) -> str:
     """Full integration: GhostAuditV7 with DPAPIKeyProvider."""
     if not _IS_WIN:
         return SKIP
@@ -129,7 +129,7 @@ def test_ghost_audit_with_dpapi_provider(tmp_dir: str, verbose: bool) -> str:
         return f"{FAIL}: {e}"
 
 
-def test_dpapi_file_not_found(tmp_dir: str, verbose: bool) -> str:
+def _test_dpapi_file_not_found(tmp_dir: str, verbose: bool) -> str:
     """DPAPIKeyProvider raises FileNotFoundError for missing file."""
     if not _IS_WIN:
         return SKIP
@@ -146,7 +146,7 @@ def test_dpapi_file_not_found(tmp_dir: str, verbose: bool) -> str:
         return f"{FAIL}: {e}"
 
 
-def test_env_key_provider(tmp_dir: str, verbose: bool) -> str:
+def _test_env_key_provider(tmp_dir: str, verbose: bool) -> str:
     """EnvKeyProvider reads key from environment variable."""
     try:
         from core.key_provider import EnvKeyProvider
@@ -160,7 +160,7 @@ def test_env_key_provider(tmp_dir: str, verbose: bool) -> str:
         return f"{FAIL}: {e}"
 
 
-def test_env_key_provider_missing(tmp_dir: str, verbose: bool) -> str:
+def _test_env_key_provider_missing(tmp_dir: str, verbose: bool) -> str:
     """EnvKeyProvider raises RuntimeError when variable not set."""
     try:
         from core.key_provider import EnvKeyProvider
@@ -177,12 +177,12 @@ def test_env_key_provider_missing(tmp_dir: str, verbose: bool) -> str:
 
 
 TESTS = [
-    ("DPAPI Roundtrip (Protect/Unprotect)",   test_dpapi_roundtrip),
-    ("DPAPI File Provider",                    test_dpapi_file_provider),
-    ("DPAPI + GhostAuditV7 Integration",       test_ghost_audit_with_dpapi_provider),
-    ("DPAPI FileNotFoundError",                test_dpapi_file_not_found),
-    ("EnvKeyProvider — Env-Var gesetzt",       test_env_key_provider),
-    ("EnvKeyProvider — Env-Var fehlt",         test_env_key_provider_missing),
+    ("DPAPI Roundtrip (Protect/Unprotect)",   _test_dpapi_roundtrip),
+    ("DPAPI File Provider",                    _test_dpapi_file_provider),
+    ("DPAPI + GhostAuditV7 Integration",       _test_ghost_audit_with_dpapi_provider),
+    ("DPAPI FileNotFoundError",                _test_dpapi_file_not_found),
+    ("EnvKeyProvider — Env-Var gesetzt",       _test_env_key_provider),
+    ("EnvKeyProvider — Env-Var fehlt",         _test_env_key_provider_missing),
 ]
 
 

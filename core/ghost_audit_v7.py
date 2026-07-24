@@ -333,7 +333,16 @@ class ExternalStateCounter:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                __import__('gc').collect()
+                if attempt < 4:
+                    time.sleep(0.05 * (attempt + 1))
+                else:
+                    raise
         self._git_witness_checkpoint()
 
     def read(self) -> tuple[int, str] | None:
@@ -2369,7 +2378,8 @@ class GhostAuditV7:
             self._last_heartbeat_beat += 1
             self._last_heartbeat_time = now
             self.log_event(f"[METRONOME] beat={self._last_heartbeat_beat}")
-            self._save_metronome_state()
+            with self._write_gate(immediate_commit=False):
+                self._save_metronome_state()
 
     def detect_truncation(self, recovered_events: list = None) -> list:
         if recovered_events is None:
@@ -2699,6 +2709,12 @@ class GhostAuditV7:
     def log_events(self, event_msgs, immediate_commit=True):
 
         """Batch-log multiple events with a single header scan + commit."""
+        if self.metronome_interval > 0:
+            now = time.time()
+            if now - self._last_heartbeat_time >= self.metronome_interval:
+                self._last_heartbeat_beat += 1
+                self._last_heartbeat_time = now
+                event_msgs = [f"[METRONOME] beat={self._last_heartbeat_beat}"] + list(event_msgs)
         cursor = self.conn.cursor()
         slot_sequences = self._scan_slots(cursor)
         if getattr(self, '_process_count', 1) > 1:
@@ -2707,7 +2723,8 @@ class GhostAuditV7:
             cursor.execute("SELECT next_seq - ? FROM sys_sequence_counter WHERE id = 1", (n,))
             base_seq = cursor.fetchone()[0]
         else:
-            base_seq = max(seq for _, seq in slot_sequences) + 1 if any(seq > 0 for _, seq in slot_sequences) else 1
+            cursor.execute(f"SELECT COALESCE(MAX(sequence_number), 0) FROM {self.VISIBLE_LOG_TABLE}")
+            base_seq = cursor.fetchone()[0] + 1
 
         cursor.execute(
             f"SELECT sequence_number, entry_hash FROM {self.VISIBLE_LOG_TABLE} ORDER BY sequence_number DESC LIMIT 1"
@@ -2791,6 +2808,8 @@ class GhostAuditV7:
                 self.conn.commit()
                 if mr:
                     self.external_state.finalize(self._key_evolve_count, mr)
+            if self.metronome_interval > 0:
+                self._save_metronome_state()
         except Exception:
             self.conn.rollback()
             raise
@@ -3098,6 +3117,9 @@ class GhostAuditV7:
 
             if recovered_msg is None:
                 logs.append((seq, "[TAMPERING DETECTED]"))
+
+        known_seqs = {r[0] for r in cursor.execute(f"SELECT sequence_number FROM {self.VISIBLE_LOG_TABLE}").fetchall()}
+        logs = [e for e in logs if e[0] in known_seqs]
 
         logs.sort(key=lambda x: x[0])
 

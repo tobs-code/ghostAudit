@@ -3,13 +3,20 @@ import json
 import sqlite3
 from core.ghost_audit_v7 import GhostAuditV7, StegoEngine
 
+
+def _clean_db(path):
+    root, _ = os.path.splitext(path)
+    for f in [path, root + ".evolve", root + ".evolve.tmp"]:
+        if os.path.exists(f):
+            os.remove(f)
+
 def test_all_hardenings():
     db_path = "test_hardenings_v7.db"
+    root, _ = os.path.splitext(db_path)
     # Remove DB and .evolve state file so V8.3 rollback-detection starts clean
-    for suffix in ("", ".evolve", ".evolve.tmp"):
-        p = db_path + suffix
-        if os.path.exists(p):
-            os.remove(p)
+    for f in [db_path, root + ".evolve", root + ".evolve.tmp"]:
+        if os.path.exists(f):
+            os.remove(f)
 
     print("=== [V7 HARDENING TEST] ===")
     
@@ -54,10 +61,9 @@ def test_all_hardenings():
 
     # Restore DB for remaining tests — also remove .evolve so rollback-detection starts fresh
     ga.close()
-    for suffix in ("", ".evolve", ".evolve.tmp"):
-        p = db_path + suffix
-        if os.path.exists(p):
-            os.remove(p)
+    for f in [db_path, root + ".evolve", root + ".evolve.tmp"]:
+        if os.path.exists(f):
+            os.remove(f)
     ga = GhostAuditV7(db_path=db_path, secret_key="test-secure-master-key-v7-987654321", force_reinit=True)
     for ev in events:
         ga.log_event(ev)
@@ -185,6 +191,7 @@ def test_all_hardenings():
     siem_path = "test_auto_siem.jsonl"
     if os.path.exists(siem_path):
         os.remove(siem_path)
+    _clean_db("test_siem_auto.db")
     ga_siem = GhostAuditV7(db_path="test_siem_auto.db", secret_key="test-secure-master-key-v7-987654321", verbose=False, siem_export_path=siem_path)
     siem_events = ["EVENT_A: test one", "EVENT_B: test two", "EVENT_C: test three"]
     for ev in siem_events:
@@ -210,6 +217,7 @@ def test_all_hardenings():
     siem_cef_path = "test_auto_siem.cef"
     if os.path.exists(siem_cef_path):
         os.remove(siem_cef_path)
+    _clean_db("test_siem_cef.db")
     ga_siem2 = GhostAuditV7(db_path="test_siem_cef.db", secret_key="test-secure-master-key-v7-987654321", verbose=False, siem_export_path=siem_cef_path, siem_export_format="cef")
     for ev in siem_events:
         ga_siem2.log_event(ev)
@@ -233,6 +241,7 @@ def test_all_hardenings():
     fs_db = "test_fs_evolution.db"
     if os.path.exists(fs_db):
         os.remove(fs_db)
+    _clean_db(fs_db)
     ga_fs = GhostAuditV7(db_path=fs_db, secret_key="test-secure-master-key-v7-987654321", verbose=False)
     assert ga_fs._key_evolve_count == 0, "Fresh DB: evolve_count should be 0"
     k0 = bytes(ga_fs._k_write_merkle)
@@ -282,6 +291,7 @@ def test_all_hardenings():
     metro_db = "test_metronome.db"
     if os.path.exists(metro_db):
         os.remove(metro_db)
+    _clean_db(metro_db)
     ga_m = GhostAuditV7(db_path=metro_db, secret_key="test-secure-master-key-v7-987654321", verbose=False, metronome_interval=3600)
     # First event triggers immediate heartbeat (last_heartbeat_time=0)
     ga_m.log_event("User event 1")
@@ -321,6 +331,7 @@ def test_all_hardenings():
 
     # 11c. Test metronome=0 produces no heartbeats
     print("[TEST 11c] Testing metronome=0 produces no heartbeats...")
+    _clean_db("test_metro_off.db")
     ga_m2 = GhostAuditV7(db_path="test_metro_off.db", secret_key="test-secure-master-key-v7-987654321", verbose=False, metronome_interval=0)
     ga_m2.log_event("Normal event")
     recovered = ga_m2.recover_events()
@@ -339,6 +350,7 @@ def test_all_hardenings():
     mac_db = "test_event_mac.db"
     if os.path.exists(mac_db):
         os.remove(mac_db)
+    _clean_db(mac_db)
     ga_em = GhostAuditV7(db_path=mac_db, secret_key="test-secure-master-key-v7-987654321", verbose=False)
     mac_events = ["EVENT_1: first entry", "EVENT_2: second entry", "EVENT_3: third entry"]
     for ev in mac_events:

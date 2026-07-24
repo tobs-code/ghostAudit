@@ -25,13 +25,21 @@ def _raw_conn(db_path):
 
 def _cleanup(path):
     """Remove DB and associated files including the .evolve state file."""
-    for s in ("", "-wal", "-shm", "-journal", ".evolve", ".evolve.tmp"):
+    root, _ = os.path.splitext(path)
+    for s in ("", "-wal", "-shm", "-journal"):
         p = path + s
         if os.path.exists(p):
             try:
                 os.remove(p)
             except PermissionError:
                 pass  # WAL files sometimes linger on Windows; non-fatal
+    for s in (".evolve", ".evolve.tmp"):
+        p = root + s
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except PermissionError:
+                pass
 
 
 # =============================================================================

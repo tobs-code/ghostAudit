@@ -5,12 +5,11 @@ from reedsolo import RSCodec, ReedSolomonError
 import hmac, hashlib, zlib
 
 DB='test_parity_v7.db'
-if os.path.exists(DB):
-    os.remove(DB)
-# Remove stale external state file so V8.3 rollback-detection doesn't fire
-_evolve = DB + ".evolve"
-if os.path.exists(_evolve):
-    os.remove(_evolve)
+_EVOLVE = DB.replace('.db', '.evolve')
+_EVOLVE_TMP = DB.replace('.db', '.evolve.tmp')
+for f in [DB, _EVOLVE, _EVOLVE_TMP]:
+    if os.path.exists(f):
+        os.remove(f)
 
 # Write a message, then verify the full recovery pipeline works
 ghost = GhostAuditV7(db_path=DB, verbose=False)
@@ -30,5 +29,6 @@ assert msg_out == msg, f'Message mismatch: {msg_out!r} != {msg!r}'
 print(f'OK: recovered message = {msg_out!r}')
 print('PASS: full recovery pipeline works with RAID-6')
 
-if os.path.exists(DB):
-    os.remove(DB)
+for f in [DB, _EVOLVE, _EVOLVE_TMP]:
+    if os.path.exists(f):
+        os.remove(f)

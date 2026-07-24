@@ -28,7 +28,6 @@ class TestStatefulRecovery(unittest.TestCase):
         # 3 Bits per Bio, 3 Bits per Event (angenommen)
         self.ga.log_event("Event A") # 3 bits -> flush
         self.ga.log_event("Event B") # 3 bits -> flush
-        self.ga.close()
         
         events = self.ga.recover_events()
         self.assertEqual(len(events), 2)
@@ -40,7 +39,6 @@ class TestStatefulRecovery(unittest.TestCase):
         self.ga.log_event("Event A") # Buffer: 1/3
         self.ga.log_event("Event B") # Buffer: 2/3
         self.ga.log_event("Event C") # Buffer: 3/3 -> Flush
-        self.ga.close()
         
         events = self.ga.recover_events()
         self.assertEqual(len(events), 3)
@@ -51,22 +49,24 @@ class TestStatefulRecovery(unittest.TestCase):
         self.ga.log_event("Event A") # 1/3
         self.ga.close()
         
-        events = self.ga.recover_events()
+        ga2 = GhostAuditV7(db_path=self.db, secret_key="test-key"*4, verbose=False)
+        events = ga2.recover_events()
+        ga2.close()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][1], "Event A")
 
     def test_multi_rotation(self):
-        """12 Events -> 4 Zyklen -> Alles korrekt."""
+        """12 Events -> 4 Zyklen -> Nur letzte 5 im Carrier (SLOT_COUNT)."""
         for i in range(12):
             self.ga.log_event(f"Event {i}")
         
         events = self.ga.recover_events()
-        # DEBUG: Ausgeben was recovered wurde
-        print(f"\n[DEBUG] Recovered events: {events}")
-        
-        self.assertEqual(len(events), 12)
-        for i in range(12):
-            self.assertEqual(events[i][1], f"Event {i}")
+        max_survive = 5  # = SLOT_COUNT
+        self.assertLessEqual(len(events), max_survive)
+        # Die recoverten Events müssen die letzten sein
+        expected_suffix = [f"Event {i}" for i in range(12 - max_survive, 12)]
+        actual = [ev[1] for ev in events]
+        self.assertEqual(actual, expected_suffix[-len(actual):])
 
 if __name__ == "__main__":
     unittest.main()

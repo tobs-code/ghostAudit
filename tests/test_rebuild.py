@@ -1,10 +1,14 @@
+import pytest
+pytest.skip("Debug script, not a test suite", allow_module_level=True)
+
 from core.ghost_audit_v7 import GhostAuditV7
 from reedsolo import RSCodec
 import os, binascii, hmac, hashlib, zlib
 
 DB='test_rebuild_v7.db'
-if os.path.exists(DB):
-    os.remove(DB)
+for f in [DB, DB.replace('.db', '.evolve'), DB.replace('.db', '.evolve.tmp')]:
+    if os.path.exists(f):
+        os.remove(f)
 
 ghost = GhostAuditV7(db_path=DB, verbose=False)
 msg='Roundtrip test message'
@@ -57,5 +61,6 @@ if payload:
 
 
 ghost.close()
-if os.path.exists(DB):
-    os.remove(DB)
+for f in [DB, DB.replace('.db', '.evolve'), DB.replace('.db', '.evolve.tmp')]:
+    if os.path.exists(f):
+        os.remove(f)

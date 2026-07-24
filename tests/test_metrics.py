@@ -51,6 +51,7 @@ def test_noop_default_in_interceptor():
         ga._pending_payloads.dec()
         ga._pending_payloads.set(0)
     finally:
+        ga.close()
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -73,6 +74,7 @@ def test_try_flush_size_trigger():
         assert result > 0           # 3/3, Size-Trigger feuert
         ga.flush_headers.assert_called_once()
     finally:
+        ga.close()
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -93,6 +95,7 @@ def test_try_flush_time_trigger():
         assert result > 0           # Time-Trigger feuert
         ga.flush_headers.assert_called_once()
     finally:
+        ga.close()
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -109,6 +112,7 @@ def test_integrity_no_false_positive():
         missing = ga.verify_pending_queue_integrity(recovered_seqs=set())
         assert missing == [], f"Expected no gap, got {missing}"
     finally:
+        ga.close()
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -129,5 +133,6 @@ def test_integrity_detects_gap():
         missing = ga.verify_pending_queue_integrity(recovered_seqs=set())
         assert seq in missing, f"Expected seq {seq} in missing, got {missing}"
     finally:
+        ga.close()
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
