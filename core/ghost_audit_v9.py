@@ -2434,6 +2434,53 @@ class GhostAuditInterceptor:
 
     # ------------------------------------------------------------------ recovery
 
+    def verify_pending_queue_integrity(
+        self, recovered_seqs: set[int] | None = None,
+    ) -> list[int]:
+        """Prüft ob alle geloggten Events auch recovered oder noch pending sind.
+
+        ``audit_log``-Seq-Nummern werden gegen ``recovered_seqs`` + pending queue
+        differenz-bildet.  Fehlende Seq-Nummern = stille Löschung durch einen
+        Angreifer (Pending-Queue-Attack).
+
+        Parameters
+        ----------
+        recovered_seqs : set[int] or None
+            Sequence numbers aus ``recover_events()``.
+            Wenn None, wird ``recover_events()`` intern aufgerufen.
+
+        Returns ``list[int]`` der Lücken (leer = OK).
+        """
+        cursor = self._engine.conn.cursor()
+        cursor.execute(
+            f"SELECT sequence_number FROM {self._engine.VISIBLE_LOG_TABLE} "
+            f"ORDER BY sequence_number"
+        )
+        audit_seqs = {r[0] for r in cursor.fetchall()}
+        if not audit_seqs:
+            return []
+
+        if recovered_seqs is None:
+            recovered_seqs = {seq for seq, _ in self.recover_events()}
+
+        cursor.execute("SELECT seq FROM sys_cache_pending_queue")
+        pending_seqs = {r[0] for r in cursor.fetchall()}
+
+        missing = sorted(audit_seqs - recovered_seqs - pending_seqs)
+
+        if missing:
+            self._engine.log_events(
+                [f"INTEGRITY_VIOLATION: Pending-Queue-Gap: seqs={missing}"],
+                immediate_commit=True,
+            )
+            if self.verbose:
+                print(
+                    f"[V9] INTEGRITY VIOLATION: {len(missing)} events missing "
+                    f"from recovery and not pending: {missing}"
+                )
+
+        return missing
+
     def recover_events(self) -> list[tuple[int, str]]:
         """Recover all logged events from the carrier table.
 
@@ -2448,8 +2495,11 @@ class GhostAuditInterceptor:
         self.flush_headers()
         is_external = (self.config.table != "sys_cache")
         if not is_external:
-            return self._engine.recover_events()
-        return self._recover_from_external_carrier()
+            events = self._engine.recover_events()
+        else:
+            events = self._recover_from_external_carrier()
+        self.verify_pending_queue_integrity(recovered_seqs={seq for seq, _ in events})
+        return events
 
     def _recover_from_external_carrier(self) -> list[tuple[int, str]]:
         """V9 recovery path for external app-table carriers.

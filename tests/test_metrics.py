@@ -95,3 +95,39 @@ def test_try_flush_time_trigger():
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_integrity_no_false_positive():
+    """verify_pending_queue_integrity: kein Gap wenn Event noch pending."""
+    tmp = tempfile.mkdtemp()
+    db_path = os.path.join(tmp, "test.db")
+    try:
+        ga = GhostAuditInterceptor(db_path, verbose=False)
+        seq = ga.log_structured_event(event_type="test", value=42)
+        assert seq is not None
+        # Event in audit_log + pending queue → kein Gap
+        missing = ga.verify_pending_queue_integrity(recovered_seqs=set())
+        assert missing == [], f"Expected no gap, got {missing}"
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_integrity_detects_gap():
+    """verify_pending_queue_integrity: Gap bei gelöschtem Pending-Row."""
+    tmp = tempfile.mkdtemp()
+    db_path = os.path.join(tmp, "test.db")
+    try:
+        ga = GhostAuditInterceptor(db_path, verbose=False)
+        seq = ga.log_structured_event(event_type="secret", value=99)
+        assert seq is not None
+        # Pending Queue-Row löschen (simulierter Angriff)
+        cursor = ga._engine.conn.cursor()
+        cursor.execute("DELETE FROM sys_cache_pending_queue WHERE seq = ?", (seq,))
+        ga._engine.conn.commit()
+        # audit_log hat den Event, aber weder pending noch recovered
+        missing = ga.verify_pending_queue_integrity(recovered_seqs=set())
+        assert seq in missing, f"Expected seq {seq} in missing, got {missing}"
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
