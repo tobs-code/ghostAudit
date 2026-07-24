@@ -2,7 +2,7 @@
 
 > Research project — not intended for production use.
 
-GhostAudit hides audit logs **steganographically inside ordinary SQLite user data**. In the current V9 path, the carrier is a real application table supplied by the caller, and GhostAudit overlays bits on normal app writes. A privileged attacker who deletes the visible log tables finds nothing — the real forensic data is invisibly embedded in carrier fields and cryptographically secured.
+GhostAudit hides audit logs **steganographically inside ordinary SQLite user data**. In the current V10 path, the carrier is a real application table supplied by the caller, and GhostAudit overlays bits on normal app writes. A privileged attacker who deletes the visible log tables finds nothing — the real forensic data is invisibly embedded in carrier fields and cryptographically secured.
 
 ```python
 from core.carrier_config import CarrierConfig
@@ -358,6 +358,8 @@ rebuild_nsym = min(target_nsym, payload_rows // 8)         # Kapazitäts-Cap
 
 Ein Checkpoint ist ein kompaktes, signiertes JSON-Dokument, das den DB-Zustand zu einem bestimmten Zeitpunkt festhält. Er ist dafür gedacht, in einer **externen, read-only Location** gespeichert zu werden — Git-Repo, separate Datei, Pastebin — und dort als unabhängiger Witness zu fungieren.
 
+*(Der Checkpoint-Mechanismus wurde in V9.4 um den TSA-Witness erweitert — siehe nächster Abschnitt.)*
+
 **Was ein Checkpoint beweist (mit Master-Key):**
 - Der Merkle-Root des Carrier-Layers war genau `R` bei Sequence `N`
 - Die Event-Kette (`entry_hash`-Chain) war zu diesem Zeitpunkt intakt
@@ -394,7 +396,7 @@ result = ga.verify_checkpoint(cp)
 # result["details"]            → "OK" oder Fehlerbeschreibung
 ```
 
-**TSA-Witness (V9.4):** Seit V9.4 wird der `.evolve`-Digest automatisch nach jedem `log_event(immediate_commit=True)` an eine RFC 3161 Time-Stamp Authority gesubmitted (Best-Effort Background-Thread, pollt alle 30s). Der signierte Timestamp-Token wird in `sys_witness_queue` persistiert. `export_checkpoint()` hängt den Witness-Status ans Checkpoint-Dict an:
+**V9.4 — TSA-Witness (RFC 3161):** Seit V9.4 wird der `.evolve`-Digest automatisch nach jedem `log_event(immediate_commit=True)` an eine RFC 3161 Time-Stamp Authority gesubmitted (Best-Effort Background-Thread, pollt alle 30s). Der signierte Timestamp-Token wird in `sys_witness_queue` persistiert. `export_checkpoint()` hängt den Witness-Status ans Checkpoint-Dict an:
 
 ```python
 cp = ga.export_checkpoint()
@@ -441,7 +443,7 @@ Ein Inclusion Proof (O(log n) Sibling-Hashes pro Event) wäre nur dann stärker,
 
 ### V9.17 — Active-Analyst Test Suite
 
-V9.2 erweitert das Threat-Model um einen **aktiven Analysten** mit Schreibrechten, der gezielt Carrier-Rows manipuliert, um die Reaktion des Systems zu provozieren. Die Test-Suite in [`tests/test_v9_active_analyst.py`](file:///c:/Users/tobs/.cursor/workspace/err/tests/test_v9_active_analyst.py) deckt fünf Angriffsvektoren ab:
+V9.17 erweitert das Threat-Model um einen **aktiven Analysten** mit Schreibrechten, der gezielt Carrier-Rows manipuliert, um die Reaktion des Systems zu provozieren. Die Test-Suite in [`tests/test_v9_active_analyst.py`](file:///c:/Users/tobs/.cursor/workspace/err/tests/test_v9_active_analyst.py) deckt fünf Angriffsvektoren ab:
 
 | Vektor | Angriff | Erwartete Reaktion |
 |--------|---------|--------------------|
