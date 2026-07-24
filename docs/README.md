@@ -848,18 +848,18 @@ python tests/benchmark_throughput_v8.py
 
 | Bereich | Tests | Status |
 |---------|-------|--------|
-| V9 Interceptor (CarrierConfig, Calibration, Intercept, Temporal Delay, Float Coverage, External Carrier, Multi-Process, Integer Channel Ch0, MAC-Verify, try_flush) | ~33 | ✅ |
-| Active-Analyst (Probe&Tamper, Column Wipe, Timing, Injection, Erasure) | 5 | ✅ |
-| Carrier Discovery (PRAGMA, Pattern-Matching, Warning-Branches, generated Config) | 7 | ✅ |
-| Metrics (Noop-Registry, Interceptor-Integration, Size-Trigger, Time-Trigger) | 4 | ✅ |
-| Hardware Resilience (Basic, Truncation, Corruption, Multi-Event, Physical) | 5 | ✅ |
-| Avatar Carrier V8 (StegoEngine, MAC, Shuffling, Bio-Normalize, Schema, ORM) | 10 | ✅ |
-| Härtungs-Tests V7 (LSB, Forward Security, Merkle, Export, Metronome, SIEM) | 1 | ✅ |
-| Partial Fragment Loss (RS Recovery, Labels, Mixed, Header, XOR Guard) | 6 | ✅ |
-| Stateful Recovery (Boundary, Partial, Close, Multi-Rotation) | 4 | ✅ |
-| Rollback Detection V8.2 | 1 | ✅ |
-| **Shamir SSS (Split, Reconstruct, SQL, GA-Integration)** | **10** | ✅ |
-| Debug-Skripte (keine Testsuiten) | 4 | ⏭️ skipped |
+| V9 Interceptor (CarrierConfig, Calibration, Intercept, Temporal Delay, Float Coverage, External Carrier, Multi-Process, Integer Channel Ch0, MAC-Verify, try_flush) | ~33 | ok |
+| Active-Analyst (Probe&Tamper, Column Wipe, Timing, Injection, Erasure) | 5 | ok |
+| Carrier Discovery (PRAGMA, Pattern-Matching, Warning-Branches, generated Config) | 7 | ok |
+| Metrics (Noop-Registry, Interceptor-Integration, Size-Trigger, Time-Trigger) | 4 | ok |
+| Hardware Resilience (Basic, Truncation, Corruption, Multi-Event, Physical) | 5 | ok |
+| Avatar Carrier V8 (StegoEngine, MAC, Shuffling, Bio-Normalize, Schema, ORM) | 10 | ok |
+| Härtungs-Tests V7 (LSB, Forward Security, Merkle, Export, Metronome, SIEM) | 1 | ok |
+| Partial Fragment Loss (RS Recovery, Labels, Mixed, Header, XOR Guard) | 6 | ok |
+| Stateful Recovery (Boundary, Partial, Close, Multi-Rotation) | 4 | ok |
+| Rollback Detection V8.2 | 1 | ok |
+| **Shamir SSS (Split, Reconstruct, SQL, GA-Integration)** | **10** | ok |
+| Debug-Skripte (keine Testsuiten) | 4 | skipped |
 
 ### Angriffssimulation V8
 
