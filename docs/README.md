@@ -521,6 +521,40 @@ python scripts/init_shares.py --shares 5 --threshold 3 \
 - Jedes Byte des Keys wird als Polynom-Koeffizient behandelt (byteweises SSS)
 - Kompatibel mit `key_provider=` und `secret_key=` — Shares haben höchste Priorität
 
+### V10.1 — Channel-Weighted Stripping (Adaptive Bit Distribution)
+
+Die Datenbits eines Events werden nicht mehr gleichmäßig auf die 5 logischen Kanäle verteilt, sondern gemäß den gemessenen Kanalqualitäten gewichtet. Ein Kanal mit niedriger Degradation bekommt mehr Bits zugewiesen (weil er zuverlässiger ist), ein stark degradierter Kanal entsprechend weniger.
+
+**Konzept:**
+- `sys_channel_quality` (Slot 0) speichert EMA-basierte Degradationswerte pro Kanal (0.0 = perfekt, 1.0 = vollständig degradiert)
+- `_get_channel_weights(slot_idx)` liest Slot 0 als kanonische Referenz und berechnet normierte Gewichte: `w_i = (1 - q_i) / Σ(1 - q_j)`
+- Bei fehlender Qualitätshistorie (`quality=None`) werden keine Gewichte verwendet → gleichmäßige Verteilung (Round-Robin)
+- `has_weights`-Flag im Header (Bit 6) signalisiert der Recovery, dass Gewichte via `sys_channel_quality` nachgeschlagen werden müssen — die Gewichte selbst werden **nicht** im Payload gespeichert
+
+**Weighted-Fair-Queuing Plan:**
+- `_weighted_plan(channel_weights)` erzeugt einen interleaved Plan der Länge `DATA_CHANNEL_COUNT * 5` (z.B. 15 Einträge), der Kanäle proportional zu ihrem Gewicht fair queued
+- Beispiel: Gewichte `(0.5, 0.3, 0.2)` → Plan der Länge 15 (z.B. `[0,1,0,2,0,1,0,2,0,1,0,2,0,1,0]`)
+- Kein Kanal verhungert (Starvation): jeder Kanal erscheint mindestens einmal pro Plan-Fenster
+
+**Vorteile:**
+- Degradierte Kanäle erhalten weniger Bits → weniger RS-Fehler auf diesen Kanälen
+- Intakte Kanäle tragen mehr Last → bessere Gesamt-Effizienz
+- Automatische Anpassung an Carrier-Umgebungen mit asymmetrischer Feld-Stabilität
+- Rückwärtskompatibel: Alte Events ohne `has_weights`-Flag werden mit Round-Robin decodiert
+
+**Betroffene Methoden:**
+- `_get_channel_weights()` (neu) — liest Slot 0 Quality, gibt `(w0,w1,w2)` oder `None`
+- `_weighted_plan()` (neu) — Fair-Queuing Plan Builder
+- `_encode_payload_per_channel_v7` — akzeptiert `channel_weights`
+- `_per_channel_rs_encoded_bit_count` — akzeptiert `channel_weights`
+- `_rebuild_payload_from_channel_bytes` — per-channel `ch_consumed[c]` Counter
+- `_build_legacy_header` / `_decode_header` — `has_weights`-Bit (Bit 6)
+- `_prepare_event` — gibt 6-Tuple zurück (added `channel_weights`)
+- `_write_event_to_slots` — schreibt `has_weights` in Header
+- `_seed_carrier_quality` — early-return wenn Slot 0 Quality existiert
+- Recovery (`_recover_single_slot`, `_recover_from_aux`) — liest `has_weights`, berechnet cw aus Quality
+- Recovery Quality-Update: überspringt Slot 0 (`if slot_idx == 0: continue`)
+
 ---
 
 ## Konfiguration & Env-Vars

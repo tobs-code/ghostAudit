@@ -565,7 +565,7 @@ class _V9Engine(GhostAuditV7):
             manifest_buffer
         )
 
-    def _write_event_to_slots(self, cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences):
+    def _write_event_to_slots(self, cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences, channel_weights=None):
         """V9: Carrier writes are handled by the Interceptor's intercept() loop.
         
         The engine's log_events() path must NOT write directly to the app table

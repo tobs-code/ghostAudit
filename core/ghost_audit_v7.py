@@ -456,9 +456,10 @@ class GhostAuditV7:
     PARITY_CHANNEL = 3         # P parity (XOR of data channels)
     SECOND_PARITY_CHANNEL = 4  # Q parity (GF(2^8) weighted sum of data channels)
     REPLICA_COUNT = max(1, min(int(os.environ.get("GHOST_AUDIT_REPLICA_COUNT", "3")), 5))
+    CHANNEL_WEIGHT_BYTES = 3  # V10.1: 1 uint8 per data channel for bit-distribution
     
     # V7 verwendet ausschließlich Per-Channel-RS (kein Combined-Modus).
-    # Das Env-Flag GHOST_AUDIT_PER_CHANNEL_RS wird ignoriert.
+    # Das Env-Flag GHOST_AUDIT_PER_CHANNEL_RS wird ignoriert.    
     PER_CHANNEL_RS = True
     # Magic bytes are derived via k_magic — no hardcoded constants.
     # An attacker scanning for fixed marker bytes cannot detect GhostAudit headers.
@@ -764,11 +765,11 @@ class GhostAuditV7:
         return bits
 
     # --- Encode Payload with RAID-6 Parity (P + Q) ---
-    def _encode_payload_per_channel_v7(self, payload_bytes: bytes, selected_nsym: int):
+    def _encode_payload_per_channel_v7(self, payload_bytes: bytes, selected_nsym: int, channel_weights=None):
         """
         Per-Channel RS encoding with RAID-6 P+Q parity (3 data + 2 parity).
 
-        - Partition payload into 3 data channels (round-robin)
+        - Partition payload into 3 data channels (weighted by channel_weights, or round-robin if None)
         - RS-encode each independently
         - Compute P (XOR) and Q (GF(2^8) weighted sum)
         - Return {channel: encoded_bytes} for channels 0-4
@@ -776,8 +777,9 @@ class GhostAuditV7:
         raw_bits = self._bytes_to_bits(payload_bytes)
         channel_bits = [[] for _ in range(self.DATA_CHANNEL_COUNT)]
 
+        plan, total = self._weighted_plan(channel_weights)
         for b_idx, bit_val in enumerate(raw_bits):
-            channel_bits[b_idx % self.DATA_CHANNEL_COUNT].append(bit_val)
+            channel_bits[plan[b_idx % total]].append(bit_val)
 
         channel_encoded = {}
         for c in range(self.DATA_CHANNEL_COUNT):
@@ -892,14 +894,18 @@ class GhostAuditV7:
             ids.extend(slot_ids[self.HEADER_BIT_COUNT :])
         return ids
 
-    def _per_channel_rs_encoded_bit_count(self, stored_msg_len, nsym):
+    def _per_channel_rs_encoded_bit_count(self, stored_msg_len, nsym, channel_weights=None):
         """RS-encoded bit count per channel (3 data + 2 parity)."""
         payload_bit_count = (16 + stored_msg_len) * 8
         counts = []
 
+        plan, total = self._weighted_plan(channel_weights)
+        full_cycles = payload_bit_count // total
+        remainder = payload_bit_count % total
+
         data_encoded_lens = []
         for c in range(self.DATA_CHANNEL_COUNT):
-            n_bits = (payload_bit_count + self.DATA_CHANNEL_COUNT - 1 - c) // self.DATA_CHANNEL_COUNT
+            n_bits = full_cycles * (plan.count(c) if channel_weights else 1) + plan[:remainder].count(c)
             ch_bytes = self._bits_to_bytes([0] * n_bits)
             encoded = RSCodec(nsym).encode(ch_bytes)
             data_encoded_lens.append(len(encoded))
@@ -917,14 +923,20 @@ class GhostAuditV7:
         counts.append(len(q_encoded) * 8)
         return counts
 
-    def _rebuild_payload_from_channel_bytes(self, channel_bytes, stored_msg_len):
-        """Round-robin inverse to rebuild payload from 5 channels (3 data + 2 parity)."""
+    def _rebuild_payload_from_channel_bytes(self, channel_bytes, stored_msg_len, channel_weights=None):
+        """Weighted inverse to rebuild payload from 5 channels (3 data + 2 parity).
+
+        Uses the channel_weights plan for inverse of weighted distribution.
+        Defaults to round-robin (equal weights) when channel_weights is None.
+        """
         total_bits = (16 + stored_msg_len) * 8
+        plan, total = self._weighted_plan(channel_weights)
+        ch_consumed = [0] * self.DATA_CHANNEL_COUNT
         raw_bits = []
         for global_idx in range(total_bits):
-            # Payload bits were round-robin distributed across DATA_CHANNEL_COUNT (4), parity is separate
-            channel = global_idx % self.DATA_CHANNEL_COUNT
-            local_idx = global_idx // self.DATA_CHANNEL_COUNT
+            channel = plan[global_idx % total]
+            local_idx = ch_consumed[channel]
+            ch_consumed[channel] += 1
             byte_idx = local_idx // 8
             bit_pos = 7 - (local_idx % 8)
             block = channel_bytes.get(channel)
@@ -1227,8 +1239,9 @@ class GhostAuditV7:
                 if len(bytes_data) < 8:
                     return None
                 flags_and_nsym = bytes_data[3]
-                nsym = flags_and_nsym & 0x7F
+                nsym = flags_and_nsym & 0x3F
                 compressed = bool(flags_and_nsym & 0x80)
+                has_weights = bool(flags_and_nsym & 0x40)
                 msg_len = (bytes_data[1] << 8) | bytes_data[2]
                 sequence_number = (
                     (bytes_data[4] << 24)
@@ -1242,6 +1255,7 @@ class GhostAuditV7:
                     "nsym": nsym,
                     "sequence_number": sequence_number,
                     "compressed": compressed,
+                    "has_weights": has_weights,
                     "fragment_index": 0,
                     "fragment_count": 1,
                     "mode": "legacy",
@@ -1265,6 +1279,7 @@ class GhostAuditV7:
                     "nsym": nsym,
                     "sequence_number": sequence_number,
                     "compressed": compressed,
+                    "has_weights": False,
                     "fragment_index": 0,
                     "fragment_count": fragment_count,
                     "mode": "fragment",
@@ -1273,9 +1288,9 @@ class GhostAuditV7:
             return None
         return None
 
-    def _build_legacy_header(self, stored_msg_len, nsym, sequence_number, compressed, slot_idx=0):
+    def _build_legacy_header(self, stored_msg_len, nsym, sequence_number, compressed, slot_idx=0, has_weights=False):
         magic = self._keyed_magic(self.k_magic, is_fragment=False)
-        flags_and_nsym = nsym | (0x80 if compressed else 0)
+        flags_and_nsym = nsym | (0x80 if compressed else 0) | (0x40 if has_weights else 0)
         return struct.pack(">B H B I", magic, stored_msg_len, flags_and_nsym, sequence_number)
 
     def _build_fragment_header(self, stored_msg_len, nsym, sequence_number, compressed, fragment_index, fragment_count, frag_len, slot_idx=0):
@@ -1458,6 +1473,48 @@ class GhostAuditV7:
         if not rows:
             return None
         return {r[0]: r[1] for r in rows}
+
+    def _get_channel_weights(self, slot_idx):
+        """Compute distribution weights for the 3 data channels from sys_channel_quality.
+
+        Always uses slot 0's quality (the bootstrap seed) to ensure weights
+        are stable across writes and recoveries — the recovery path updates
+        per-slot quality (for migration heuristics) but that must not alter
+        the weights that events were originally encoded with.
+        Returns (w0, w1, w2) tuple or None if no quality exists at all.
+        """
+        quality = self._get_channel_quality(0)
+        if quality is None:
+            return None
+        weights = []
+        for c in range(self.DATA_CHANNEL_COUNT):
+            erasure_pct = quality.get(c, 0.0)
+            w = max(1, 255 - int(erasure_pct * 255))
+            weights.append(w)
+        return (weights[0], weights[1], weights[2])
+
+    def _weighted_plan(self, channel_weights):
+        """Build an interleaved cycle plan from channel weights.
+
+        Uses smallest-position-first interleaving so that every channel
+        appears early in the plan (no channel starved for small payloads).
+
+        E.g. weights (5, 3, 2) → [0,1,2,0,1,0,1,0,0,2].
+        Falls back to round-robin [0,1,2] when channel_weights is None.
+        Returns (plan, total_weight).
+        """
+        if channel_weights is None:
+            total = self.DATA_CHANNEL_COUNT
+            return list(range(self.DATA_CHANNEL_COUNT)), total
+        total = sum(channel_weights)
+        n = len(channel_weights)
+        plan = []
+        pos = [0.0] * n
+        for _ in range(total):
+            c = min(range(n), key=lambda i: pos[i] / channel_weights[i])
+            plan.append(c)
+            pos[c] += 1.0
+        return plan, total
 
     def _update_channel_quality(self, slot_idx, channel, erasure_pct, sample_count=1):
         """Persist per-channel erasure rate (asymmetric EMA: fast attack, slow release)."""
@@ -1745,8 +1802,13 @@ class GhostAuditV7:
         Probes the first occupied slot (or slot 0) and seeds sys_channel_quality.
         No-op if the probe table is empty (fresh DB with no rows yet on bootstrap
         path — bootstrap seeds after rows are populated).
+        Only writes quality when slot 0 has no existing entry so that
+        weights remain stable between write and recovery.
         """
         cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM sys_channel_quality WHERE slot_idx=0")
+        if cursor.fetchone()[0] > 0:
+            return
         slot_payload_ids = self._orig_ids[self.HEADER_BIT_COUNT : self.SLOT_SIZE]
         probe = self._probe_carrier_integrity(cursor, slot_payload_ids)
         if probe and any(v > 0.0 for v in probe.values()):
@@ -2448,8 +2510,8 @@ class GhostAuditV7:
         self._cached_slot_sequences = slot_sequences
         return slot_sequences
 
-    def _prepare_event(self, event_msg, new_seq, prev_hash, min_nsym=0, min_repetitions=1):
-        """Encode an event: compress, MAC, RS-encode. Returns (channel_blocks, stored_msg_bytes, store_compressed, selected_nsym, mac)."""
+    def _prepare_event(self, event_msg, new_seq, prev_hash, min_nsym=0, min_repetitions=1, channel_weights=None):
+        """Encode an event: compress, MAC, RS-encode. Returns (channel_blocks, stored_msg_bytes, store_compressed, selected_nsym, mac, channel_weights)."""
         msg_bytes = event_msg.encode("utf-8")
         compressed_bytes = zlib.compress(msg_bytes, level=9)
         store_compressed = len(compressed_bytes) < len(msg_bytes)
@@ -2467,10 +2529,10 @@ class GhostAuditV7:
 
         selected_nsym = self._select_ecc_symbols(ecc_plan_len, rows_for_ecc, per_channel=True, min_nsym=min_nsym)
         self._current_min_repetitions = min_repetitions
-        channel_blocks = self._encode_payload_per_channel_v7(payload_bytes, selected_nsym)
-        return channel_blocks, stored_msg_bytes, store_compressed, selected_nsym, mac
+        channel_blocks = self._encode_payload_per_channel_v7(payload_bytes, selected_nsym, channel_weights=channel_weights)
+        return channel_blocks, stored_msg_bytes, store_compressed, selected_nsym, mac, channel_weights
 
-    def _write_event_to_slots(self, cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences):
+    def _write_event_to_slots(self, cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences, channel_weights=None):
         """Write an event's encoded data to its replica slots. Returns replica_slots list."""
         active_seqs = set(seq for _, seq in slot_sequences if seq > 0)
         active_count = len(active_seqs)
@@ -2489,8 +2551,9 @@ class GhostAuditV7:
             header_ids = slot_ids[: self.HEADER_BIT_COUNT]
 
             self._write_sys_cache_slot_v8(cursor, channel_blocks, slot_payload_ids)
+            has_weights = channel_weights is not None
             header_bytes = self._build_legacy_header(
-                len(stored_msg_bytes), selected_nsym, new_seq, store_compressed, target_slot
+                len(stored_msg_bytes), selected_nsym, new_seq, store_compressed, target_slot, has_weights=has_weights
             )
             self._write_header_bits_to_slot(cursor, header_bytes, header_ids, slot_idx=target_slot)
         return replica_slots
@@ -2532,9 +2595,12 @@ class GhostAuditV7:
         seq = header_data["sequence_number"]
         payload_len = header_data.get("payload_len", 0)
         compressed = header_data.get("compressed", False)
+        has_weights = header_data.get("has_weights", False)
+
+        channel_weights = self._get_channel_weights(slot_idx) if has_weights else None
 
         # --- Extract channels ---
-        enc_bit_counts = self._per_channel_rs_encoded_bit_count(payload_len, nsym)
+        enc_bit_counts = self._per_channel_rs_encoded_bit_count(payload_len, nsym, channel_weights=channel_weights)
         max_bits = max(enc_bit_counts[c] for c in range(self.CHANNEL_COUNT)) if enc_bit_counts else 0
         slot_channel_bytes, slot_erasures = self._extract_all_channels_v8(cursor, slot_payload_ids, max_bits)
 
@@ -2571,7 +2637,7 @@ class GhostAuditV7:
             return None
 
         # --- HMAC verification ---
-        payload_bytes = self._rebuild_payload_from_channel_bytes(channel_plain, payload_len)
+        payload_bytes = self._rebuild_payload_from_channel_bytes(channel_plain, payload_len, channel_weights=channel_weights)
         if payload_bytes is None or len(payload_bytes) < 16:
             return None
         recovered_mac = payload_bytes[:16]
@@ -2646,7 +2712,8 @@ class GhostAuditV7:
         # Step 3 — re-encode with boosted parameters
         payload_bytes_full = hmac.new(self.k_hmac, stored_msg_bytes, hashlib.sha256).digest()[:16] + stored_msg_bytes
         self._current_min_repetitions = rebuild_reps
-        channel_blocks = self._encode_payload_per_channel_v7(payload_bytes_full, rebuild_nsym)
+        cw = self._get_channel_weights(slot_idx)
+        channel_blocks = self._encode_payload_per_channel_v7(payload_bytes_full, rebuild_nsym, channel_weights=cw)
 
         slot_start = slot_idx * self.SLOT_SIZE
         slot_ids = self._orig_ids[slot_start : slot_start + self.SLOT_SIZE]
@@ -2657,8 +2724,9 @@ class GhostAuditV7:
             self._write_sys_cache_slot_v8(cursor, channel_blocks, slot_payload_ids)
 
             # Step 4 — rewrite header with updated nsym/reps
+            has_weights = cw is not None
             header_bytes = self._build_legacy_header(
-                len(stored_msg_bytes), rebuild_nsym, seq, compressed, slot_idx
+                len(stored_msg_bytes), rebuild_nsym, seq, compressed, slot_idx, has_weights=has_weights
             )
             self._write_header_bits_to_slot(cursor, header_bytes, header_ids, slot_idx=slot_idx)
             self.conn.commit()
@@ -2766,17 +2834,19 @@ class GhostAuditV7:
         if self.verbose and params["min_nsym"] > 0:
             print(f"[V8 ADAPT] batch degradation={max(degradation.values()):.2f} nsym_bump={params['min_nsym']} min_reps={params['min_reps']}")
 
+        channel_weights = self._get_channel_weights(first_slot)
+
         for i, msg in enumerate(event_msgs):
             new_seq = base_seq + i
-            ch, stored, comp, nsym, mac = self._prepare_event(msg, new_seq, prev_hash, min_nsym=params["min_nsym"])
+            ch, stored, comp, nsym, mac, cw = self._prepare_event(msg, new_seq, prev_hash, min_nsym=params["min_nsym"], channel_weights=channel_weights)
             eh = self._entry_hash(new_seq, stored, comp, mac, prev_hash)
             prev_hash = eh
-            prepared.append((msg, new_seq, ch, stored, comp, nsym, mac, eh))
+            prepared.append((msg, new_seq, ch, stored, comp, nsym, mac, eh, cw))
 
         self._set_sys_cache_write_mode(True, commit=immediate_commit)
         try:
-            for msg, new_seq, channel_blocks, stored_msg_bytes, store_compressed, selected_nsym, mac, entry_hash in prepared:
-                replica_slots = self._write_event_to_slots(cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences)
+            for msg, new_seq, channel_blocks, stored_msg_bytes, store_compressed, selected_nsym, mac, entry_hash, cw in prepared:
+                replica_slots = self._write_event_to_slots(cursor, channel_blocks, stored_msg_bytes, selected_nsym, new_seq, store_compressed, slot_sequences, channel_weights=cw)
 
                 for i in range(len(replica_slots)):
                     slot_sequences[i] = (slot_sequences[i][0], new_seq)
@@ -2833,7 +2903,7 @@ class GhostAuditV7:
         if not any(m.startswith(_skip_tags) for m in event_msgs):
             self._idle_restore_check()
 
-        return [seq for _, seq, _, _, _, _, _, _ in prepared]
+        return [seq for _, seq, _, _, _, _, _, _, _ in prepared]
 
     def _recover_from_aux(self):
         """Recover events from sys_cache with V7 parity recovery."""
@@ -2920,8 +2990,10 @@ class GhostAuditV7:
                 )
 
             # Compute expected RS-encoded bit count per channel
+            has_weights = first_header.get("has_weights", False) and first_header.get("mode") == "legacy"
+            cw = self._get_channel_weights(lowest_frag_idx) if has_weights else None
             enc_bit_counts = self._per_channel_rs_encoded_bit_count(
-                first_header["payload_len"], nsym
+                first_header["payload_len"], nsym, channel_weights=cw
             )
 
             # V8: single-pass multiplexed extraction for each fragment/slot
@@ -3102,7 +3174,7 @@ class GhostAuditV7:
             candidate_lengths += [l for l in range(512, 0, -1) if l != header_len]
             for stored_msg_len in candidate_lengths:
                 payload_bytes = self._rebuild_payload_from_channel_bytes(
-                    channel_plain, stored_msg_len
+                    channel_plain, stored_msg_len, channel_weights=cw
                 )
                 if payload_bytes is None:
                     continue
@@ -3136,6 +3208,8 @@ class GhostAuditV7:
         self._set_sys_cache_write_mode(True)
         try:
             for slot_idx, channel_data in slot_quality.items():
+                if slot_idx == 0:
+                    continue
                 for channel, rates in channel_data.items():
                     avg_rate = sum(rates) / len(rates)
                     self._update_channel_quality(slot_idx, channel, avg_rate, len(rates))
